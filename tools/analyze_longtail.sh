@@ -1,0 +1,1 @@
+python analyze_longtail.py --argo2_root /scratch/project_mnt/S0202/uqdetche/lidar-longtail-mining/lion/data/argo2 --predictions /scratch/project_mnt/S0202/uqdetche/lidar-longtail-mining/lion/output/lion_models/lion_mamba_1f_1x_argo_128dim_sparse_v2/default/eval/epoch_2/val/default/result.pkl --config cfgs/lion_models/lion_mamba_1f_1x_argo_128dim_sparse_v2.yaml
