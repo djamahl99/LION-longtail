@@ -446,6 +446,8 @@ def quaternion_to_heading(qw: float, qx: float, qy: float, qz: float) -> float:
 class StandaloneLongTailEvaluator:
     """Standalone evaluator independent of OpenPCDet."""
     
+    output_dir: Path
+
     def __init__(self, config: EvaluationConfig):
         self.config = config
         self.output_dir = Path(config.output_dir)

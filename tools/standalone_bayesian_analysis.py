@@ -59,21 +59,73 @@ class BayesianParameterAnalyzer:
         Returns:
             Dictionary containing assignment details, TP/FP classifications, and metrics
         """
+        print(f"AV2 eval_dts columns: {list(eval_dts.columns)}")
+        print(f"AV2 eval_gts columns: {list(eval_gts.columns)}")
+        print(f"AV2 cfg thresholds: {cfg.affinity_thresholds_m}")
+        
         results = {
             'assignments_by_category': {},
             'global_stats': {},
             'distance_metrics': {}
         }
         
+        # Check which metric columns are available
+        dt_cols = list(eval_dts.columns)
+        print([(type(x), x) for x in dt_cols])
+
+        threshold_cols = [t for t in cfg.affinity_thresholds_m if t in dt_cols]
+        print(f"Available threshold columns: {threshold_cols}")
+
+        assert len(threshold_cols) > 0
+        
         # Use the primary threshold (usually 2.0m) for detailed analysis
         primary_threshold_idx = len(cfg.affinity_thresholds_m) // 2
         primary_threshold = cfg.affinity_thresholds_m[primary_threshold_idx]
-        threshold_col = str(primary_threshold)
+        threshold_col = primary_threshold
+        
+        # Check if required columns exist
+        required_cols = ['is_evaluated', threshold_col, 'score', 'category']
+        error_cols = ['translation_error', 'scale_error', 'orientation_error']
+        
+        missing_cols = [col for col in required_cols if col not in eval_dts.columns]
+        if missing_cols:
+            print(f"Warning: Missing required columns in eval_dts: {missing_cols}")
+            return {'error': f'Missing columns: {missing_cols}'}
+        
+        missing_error_cols = [col for col in error_cols if col not in eval_dts.columns]
+        if missing_error_cols:
+            print(f"Warning: Missing error columns in eval_dts: {missing_error_cols}")
+            # Use dummy values for missing error columns
+            for col in missing_error_cols:
+                eval_dts[col] = 0.0
         
         # Global TP/FP statistics
-        all_evaluated_dts = eval_dts[eval_dts['is_evaluated']]
-        tp_mask = all_evaluated_dts[threshold_col] == 1
-        fp_mask = all_evaluated_dts[threshold_col] == 0
+        all_evaluated_dts = eval_dts[eval_dts['is_evaluated'] == True]
+        if len(all_evaluated_dts) == 0:
+            print("Warning: No evaluated detections found")
+            return {'error': 'No evaluated detections'}
+        
+        # Convert threshold column to boolean if needed
+        if threshold_col in all_evaluated_dts.columns:
+            threshold_data = all_evaluated_dts[threshold_col]
+            # Handle different data types for threshold column
+            if threshold_data.dtype == 'bool':
+                tp_mask = threshold_data
+            else:
+                tp_mask = threshold_data == 1
+            fp_mask = ~tp_mask
+        else:
+            print(f"Warning: Threshold column {threshold_col} not found, using first available")
+            if threshold_cols:
+                threshold_col = threshold_cols[0]
+                threshold_data = all_evaluated_dts[threshold_col]
+                tp_mask = threshold_data == 1 if threshold_data.dtype != 'bool' else threshold_data
+                fp_mask = ~tp_mask
+            else:
+                print("Error: No threshold columns found")
+                return {'error': 'No threshold columns available'}
+        
+        print(f"Found {tp_mask.sum()} TPs and {fp_mask.sum()} FPs globally")
         
         results['global_stats'] = {
             'tp_scores': all_evaluated_dts[tp_mask]['score'].tolist(),
@@ -81,19 +133,35 @@ class BayesianParameterAnalyzer:
             'tp_distances': all_evaluated_dts[tp_mask]['translation_error'].tolist(),
             'tp_scale_errors': all_evaluated_dts[tp_mask]['scale_error'].tolist(),
             'tp_orientation_errors': all_evaluated_dts[tp_mask]['orientation_error'].tolist(),
-            'primary_threshold': primary_threshold
+            'primary_threshold': primary_threshold,
+            'threshold_col_used': threshold_col
         }
         
         # Per-category analysis
         for category in cfg.categories:
-            cat_dts = eval_dts[(eval_dts['category'] == category) & eval_dts['is_evaluated']]
-            cat_gts = eval_gts[(eval_gts['category'] == category) & eval_gts['is_evaluated']]
+            cat_dts = eval_dts[(eval_dts['category'] == category) & (eval_dts['is_evaluated'] == True)]
+            cat_gts = eval_gts[(eval_gts['category'] == category) & (eval_gts['is_evaluated'] == True)]
+            
+            print(f"Category {category}: {len(cat_dts)} detections, {len(cat_gts)} ground truths")
             
             if len(cat_dts) == 0:
                 continue
+            
+            # Get TP/FP masks for this category
+            if threshold_col in cat_dts.columns:
+                cat_threshold_data = cat_dts[threshold_col]
+                if cat_threshold_data.dtype == 'bool':
+                    cat_tp_mask = cat_threshold_data
+                else:
+                    cat_tp_mask = cat_threshold_data == 1
+            else:
+                print(f"Warning: Threshold column {threshold_col} not found for category {category}")
+                continue
                 
-            cat_tps = cat_dts[cat_dts[threshold_col] == 1]
-            cat_fps = cat_dts[cat_dts[threshold_col] == 0]
+            cat_tps = cat_dts[cat_tp_mask]
+            cat_fps = cat_dts[~cat_tp_mask]
+            
+            print(f"  {len(cat_tps)} TPs, {len(cat_fps)} FPs")
             
             category_data = {
                 'num_detections': len(cat_dts),
@@ -109,16 +177,21 @@ class BayesianParameterAnalyzer:
             
             # Extract size information for TPs (for bias analysis)
             if len(cat_tps) > 0:
-                # Get predicted sizes from detections
-                pred_sizes = cat_tps[['length_m', 'width_m', 'height_m']].values
-                
-                # To get true sizes, we need to match back to ground truth
-                # This requires re-running assignment for this category
-                true_sizes = self._extract_matched_gt_sizes(cat_tps, cat_gts, cfg)
-                
-                if true_sizes is not None:
-                    category_data['pred_sizes'] = pred_sizes
-                    category_data['true_sizes'] = true_sizes
+                # Check if size columns exist
+                size_cols = ['length_m', 'width_m', 'height_m']
+                if all(col in cat_tps.columns for col in size_cols):
+                    # Get predicted sizes from detections
+                    pred_sizes = cat_tps[size_cols].values
+                    
+                    # To get true sizes, we need to match back to ground truth
+                    true_sizes = self._extract_matched_gt_sizes(cat_tps, cat_gts, cfg)
+                    
+                    if true_sizes is not None and len(true_sizes) > 0:
+                        category_data['pred_sizes'] = pred_sizes
+                        category_data['true_sizes'] = true_sizes
+                        print(f"  Extracted {len(true_sizes)} matched size pairs")
+                else:
+                    print(f"  Warning: Size columns not found for {category}")
             
             results['assignments_by_category'][category] = category_data
         
