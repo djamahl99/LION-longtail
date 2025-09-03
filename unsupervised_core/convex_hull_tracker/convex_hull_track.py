@@ -184,7 +184,6 @@ class ConvexHullTrack:
         )
         initial_poses = [first_object_pose]
 
-        relative_poses = []
         constraints = []
         cumulative_pose = first_object_pose.copy()
         for i in range(1, len(timestamps)):
@@ -227,40 +226,39 @@ class ConvexHullTrack:
         for gap in range(self.stagger_step, min(self.max_stagger_gap + 1, n_frames)):
             for i in range(n_frames - gap):
                 j = i + gap
+                        
+                # Use the same coordinate frame approach as consecutive poses
+                # Transform both point sets using the reference pose at frame i
+                undo_pose = np.linalg.inv(initial_poses[i])
                 
-                cur_points = world_points_per_timestamp[i] 
-                target_points = world_points_per_timestamp[j]
-                
-                # Initialize with accumulated pose from pairwise stage
-                initial_relative = np.linalg.inv(initial_poses[i]) @ initial_poses[j]
-                
-                # Apply initial transform to get better ICP starting point
-                transformed_cur = points_rigid_transform(cur_points, initial_relative)
-                
-                # Run ICP
+                cur_points_normalized = points_rigid_transform(
+                    world_points_per_timestamp[i], undo_pose
+                )
+                target_points_normalized = points_rigid_transform(
+                    world_points_per_timestamp[j], undo_pose
+                )
+
+                # Run ICP in the normalized coordinate frame
                 R, t, A_inliers, B_inliers = icp(
-                    transformed_cur, target_points,
+                    cur_points_normalized, target_points_normalized,
                     max_iterations=self.max_icp_iterations,
                     return_inliers=True, 
                     ret_err=False
                 )
                 
-                # Create relative pose
-                icp_pose = np.eye(4)
-                icp_pose[:3, :3] = R
-                icp_pose[:3, 3] = t
-                
-                # Combine with initial estimate
-                relative_pose = initial_relative @ icp_pose
+                # Create relative pose directly from ICP result
+                relative_pose = np.eye(4)
+                relative_pose[:3, :3] = R
+                relative_pose[:3, 3] = t
                 
                 constraint = {
                     'frame_i': i,
                     'frame_j': j, 
                     'relative_pose': relative_pose,
-                    'confidence': len(A_inliers) / len(cur_points),
+                    'confidence': len(A_inliers) / len(cur_points_normalized),
                 }
                 constraints.append(constraint)
-                
+                        
 
 
         assert len(initial_poses) == len(
