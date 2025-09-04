@@ -38,7 +38,6 @@ def get_rotated_box(center_xy, length, width, yaw):
     return rotated + center_xy
 
 def get_rotated_3d_box_corners(bbox):
-    """Return 4 corners of rotated rectangle (BEV)"""
     center_xy = bbox[:2]
     center_z = bbox[2]
     length = bbox[3]

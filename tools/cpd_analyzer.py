@@ -9,109 +9,81 @@ Goal
 
 """
 
-import cProfile
-from collections import defaultdict
+import argparse
 import copy
+import cProfile
+import io
 import json
 import os
-from pprint import pprint
-import re
-import shutil
+import pickle as pkl
+import pstats
 import sys
-import argparse
-import datetime
-import glob
+from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from pprint import pprint
+from typing import Dict, Optional, Tuple
+
 import matplotlib
+import numpy as np
 import pandas as pd
 import torch
-import torch.distributed as dist
-import torch.nn as nn
-import pickle as pkl
-from scipy.spatial import Delaunay, cKDTree, ConvexHull
-import numpy as np
-
-
 import yaml
 from easydict import EasyDict
+from scipy.spatial import ConvexHull, cKDTree
 from torch import Tensor
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.tree import DecisionTreeRegressor, export_text, plot_tree
-
-# Decision Tree Classifier
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    roc_auc_score,
-    precision_recall_curve,
-    average_precision_score,
-    accuracy_score,
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    recall_score,
-    f1_score,
-)
-from sklearn.decomposition import PCA
-from sklearn.neighbors import NearestNeighbors
-from scipy.spatial.distance import cdist
-from scipy.stats import entropy
-
-import matplotlib.pyplot as plt
+import av2.geometry.polyline_utils as polyline_utils
+import av2.rendering.vector as vector_plotting_utils
 import matplotlib.patches as patches
-from matplotlib.colors import ListedColormap
+import matplotlib.pyplot as plt
 from av2.evaluation import SensorCompetitionCategories
 from av2.map.lane_segment import LaneSegment
-import av2.rendering.vector as vector_plotting_utils
-import av2.geometry.polyline_utils as polyline_utils
 from av2.map.map_api import ArgoverseStaticMap, GroundHeightLayer
 
+# from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
+from av2.structures.sweep import Sweep
+from av2.utils.io import read_city_SE3_ego
+from scipy.spatial.distance import cdist
+from scipy.stats import entropy
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    mean_squared_error,
+    r2_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 
+# Decision Tree Classifier
+from sklearn.tree import (
+    DecisionTreeClassifier,
+    DecisionTreeRegressor,
+    export_text,
+    plot_tree,
+)
 from tqdm import tqdm
 
-
+from lion.unsupervised_core.alpha_shape import AlphaShapeMFCF, OWLViTAlphaShapeMFCF
+from lion.unsupervised_core.box_utils import apply_pose_to_box, get_rotated_box
 from lion.unsupervised_core.c_proto_refine import C_PROTO, CSS
 from lion.unsupervised_core.mfcf import MFCF
-from lion.unsupervised_core.box_utils import apply_pose_to_box, get_rotated_box
-
 from lion.unsupervised_core.outline_utils import (
-    OutlineFitter,
-    points_rigid_transform,
-    correct_heading,
-    hierarchical_occupancy_score,
-    smooth_points,
-    angle_from_vector,
-    get_registration_angle,
-    box_rigid_transform,
-    correct_orientation,
-    density_guided_drift,
     KL_entropy_score,
+    OutlineFitter,
+    hierarchical_occupancy_score,
+    points_rigid_transform,
     smooth_points_and_ppscore,
 )
 from lion.unsupervised_core.rotate_iou_cpu_eval import rotate_iou_cpu_eval
-from lion.unsupervised_core.alpha_shape import AlphaShapeMFCF, OWLViTAlphaShapeMFCF
-
-
-# from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
-
-
-from av2.structures.sweep import Sweep
-from av2.utils.io import read_city_SE3_ego
-from av2.map.map_api import ArgoverseStaticMap
-
-
-
 
 # Remove position-based features that shouldn't affect quality
 IGNORE_COLS = [
@@ -391,6 +363,9 @@ def parse_config():
     )
     parser.add_argument("--start_epoch", type=int, default=0, help="")
     parser.add_argument("--save_to_file", action="store_true", default=False, help="")
+
+    parser.add_argument("--profile", action="store_true", default=False, help="")
+
 
     args = parser.parse_args()
 
@@ -1203,7 +1178,7 @@ def load_and_plot_objects(
 
     # Print summary statistics
     valid_objects = len([s for s in outline_scores if s > score_thresh])
-    print(f"\nSummary Statistics:")
+    print("\nSummary Statistics:")
     print(f"Total frames: {len(outline_infos)}")
     print(f"Total unique objects: {len(object_trajectories)}")
     print(f"Valid objects in reference frame (score > 0): {valid_objects}")
@@ -1262,7 +1237,7 @@ def load_and_plot_alpha_shapes(
 
     # Extract trajectories
     object_trajectories = defaultdict(list)
-    object_frames = defaultdict(set)
+    object_frames = defaultdict(list)
     frame_object_counts = []
 
     log_dir = Path("/home/uqdetche/lidar_longtail_mining/lion/data/argo2/sensor/val") / log_id
@@ -1271,23 +1246,29 @@ def load_and_plot_alpha_shapes(
     for frame_idx, frame_info in enumerate(alpha_shape_infos):
         alpha_shapes = frame_info.get("alpha_shapes", [])
         alpha_ids = frame_info.get("outline_ids", [])
-        tracked_objects = frame_info.get("tracked_objects")
+        alpha_poses = frame_info.get("outline_poses", [])
+        timestamp = frame_info['timestamp_ns']
+        # tracked_objects = frame_info.get("tracked_objects")
         # print("frame_info", frame_info.keys())
         # print("frame_info", {k: len(v) for k, v in frame_info.items() if isinstance(v, list)})
 
         frame_object_counts.append(len(alpha_shapes))
 
-        for alpha_id in alpha_ids:
-            track = tracked_objects[alpha_id]
+        for alpha_id, alpha_pose in zip(alpha_ids, alpha_poses):
+            # track = tracked_objects[alpha_id]
 
-            assert track.track_id == alpha_id, f"{track.track_id=} {alpha_id=}"
+            # assert track.track_id == alpha_id, f"{track.track_id=} {alpha_id=}"
 
             # print(track.keys())
             # pprint(track)
 
-            if alpha_id not in object_trajectories:
-                object_trajectories[alpha_id] = np.array([x[:3, 3] for x in track.optimized_poses])
-                object_frames[alpha_id] = set(i for i in track.timestamps)
+            object_frames[alpha_id].append(timestamp)
+            object_trajectories[alpha_id].append(alpha_pose[:3, 3])
+
+
+            # if alpha_id not in object_trajectories:
+            #     object_trajectories[alpha_id] = np.array([x[:3, 3] for x in track.optimized_poses])
+            #     object_frames[alpha_id] = set(i for i in track.timestamps)
 
             # for object_pose in track['object_to_world_poses']:
             #     translation = object_pose[:3, 3]
@@ -1313,6 +1294,9 @@ def load_and_plot_alpha_shapes(
         #                 "alpha_shape": alpha_shape,
         #             }
         #         )
+            
+    for k in object_trajectories.keys():
+        object_trajectories[k] = np.array(object_trajectories[k])
 
     # Choose reference frame
     if ref_frame_idx is None or (use_first_frame or len(frame_object_counts) == 0):
@@ -1574,7 +1558,7 @@ def load_and_plot_alpha_shapes(
     )
 
     # Print summary
-    print(f"\nAlpha Shape Summary:")
+    print("\nAlpha Shape Summary:")
     print(f"Total frames: {len(alpha_shape_infos)}")
     print(f"Total unique objects: {len(object_trajectories)}")
     print(f"Alpha shapes in reference frame: {len(alpha_shapes)}")
@@ -1627,12 +1611,12 @@ def analyze_object_data(output_info_path):
     print(f"Average objects per frame: {np.mean(analysis['objects_per_frame']):.1f}")
     print(f"Max objects in single frame: {max(analysis['objects_per_frame'])}")
     print(f"Frame with most objects: {np.argmax(analysis['objects_per_frame'])}")
-    print(f"\nClass distribution:")
+    print("\nClass distribution:")
     for cls, count in analysis["classes_distribution"].items():
         avg_score = analysis["average_scores"][cls]
         print(f"  {cls}: {count} detections (avg score: {avg_score:.3f})")
 
-    print(f"\nObject lifecycles:")
+    print("\nObject lifecycles:")
     for obj_id, frames in analysis["object_lifecycles"].items():
         print(
             f"  Object {obj_id}: appears in {len(frames)} frames "
@@ -3078,7 +3062,7 @@ def analyze_lidar_shadow(
         # Your debug plotting code, but update to show the correct shadow region
         fig, ax = plt.subplots(figsize=(8, 8))
         ax.set_aspect("equal")
-        ax.set_title(f"LiDAR Shadow Frustum (BEV)")
+        ax.set_title("LiDAR Shadow Frustum (BEV)")
 
         # print("bbox_point_count", bbox_point_count)
         # print("shadow_points", shadow_points)
@@ -4290,7 +4274,7 @@ def train_interpretable_classifier(
     print(f"Recall: {recall:.3f}")
     print(f"F1 Score: {f1:.3f}")
     print(f"AUC: {auc:.3f}")
-    print(f"\nConfusion Matrix:")
+    print("\nConfusion Matrix:")
     print(f"  TP: {tp}, FP: {fp}")
     print(f"  FN: {fn}, TN: {tn}")
 
@@ -4299,7 +4283,7 @@ def train_interpretable_classifier(
         {"feature": feature_cols, "importance": dt_clf.feature_importances_}
     ).sort_values("importance", ascending=False)
 
-    print(f"\nTop 5 Most Important Features:")
+    print("\nTop 5 Most Important Features:")
     print(feature_importance.head())
 
     # Method 1: Text representation of the tree
@@ -4392,7 +4376,7 @@ def train_interpretable_tree_category_classifier(
     class_counts = y.value_counts()
     classes_to_keep = class_counts[class_counts > min_samples_per_class].index.tolist()
 
-    print(f"Class counts before filtering:")
+    print("Class counts before filtering:")
     for cls, count in class_counts.items():
         print(f"  {cls}: {count} samples")
 
@@ -4415,7 +4399,7 @@ def train_interpretable_tree_category_classifier(
     class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
     idx_to_class = {idx: cls for cls, idx in class_to_idx.items()}
 
-    print(f"\nFinal class mapping:")
+    print("\nFinal class mapping:")
     for cls, idx in class_to_idx.items():
         print(f"  {cls} -> {idx}")
 
@@ -4427,7 +4411,7 @@ def train_interpretable_tree_category_classifier(
     class_counts = y_encoded.value_counts()
     classes_to_keep = class_counts[class_counts > min_samples_per_class].index
 
-    print(f"Class counts before filtering:")
+    print("Class counts before filtering:")
     for idx, count in class_counts.items():
         class_name = idx_to_class[idx]
         print(f"  {class_name}: {count} samples")
@@ -4643,22 +4627,24 @@ def analyze_mfcf(args, cfg, dataset_dir: Path, output_dir: Path):
         "Pedestrian": SensorCompetitionCategories.PEDESTRIAN.value,
     }
 
-    features_output_path = output_dir / f"mfcf_features.feather"
+    features_output_path = output_dir / "mfcf_features.feather"
     # Extract features with accurate CSS re-computation
     if not features_output_path.exists():
         serialized_dts_list = []
         for log_id in tqdm(cproto_log_ids, desc="Extracting all features"):
             cproto_output_path = get_mfcf_output_path(output_dir, log_id)
 
-            cur_features_output_path = output_dir / log_id / f"mfcf_features.feather"
+            cur_features_output_path = output_dir / log_id / "mfcf_features.feather"
 
             # TODO: COMMENT OUT LATER
             if cur_features_output_path.exists():
                 os.remove(cur_features_output_path)
 
             if not cur_features_output_path.exists():
-                pr = cProfile.Profile()
-                pr.enable()
+                
+                if args.profile:
+                    pr = cProfile.Profile()
+                    pr.enable()
 
                 df_features = extract_all_features_accurate(
                     output_info_path=str(cproto_output_path),
@@ -4670,18 +4656,18 @@ def analyze_mfcf(args, cfg, dataset_dir: Path, output_dir: Path):
                     gts_dataframe=gts.copy(),
                     score_thresh=-1,  # no score thresh
                 )
-                pr.disable()
 
-                import pstats, io
+                if args.profile:
+                    pr.disable()
 
-                s = io.StringIO()
-                sortby = "cumtime"
-                ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-                ps.print_stats()
-                with open(
-                    "mfcf_analyzer_extract_all_features_accurate_profile_stats.txt", "w"
-                ) as f:
-                    f.write(s.getvalue())
+                    s = io.StringIO()
+                    sortby = "cumtime"
+                    ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+                    ps.print_stats()
+                    with open(
+                        "mfcf_analyzer_extract_all_features_accurate_profile_stats.txt", "w"
+                    ) as f:
+                        f.write(s.getvalue())
             else:
                 df_features = pd.read_feather(cur_features_output_path)
 
@@ -4959,7 +4945,7 @@ def analyze_cproto(args, cfg, dataset_dir: Path, output_dir: Path):
         "Pedestrian": SensorCompetitionCategories.PEDESTRIAN.value,
     }
 
-    features_output_path = output_dir / f"cpd_features.feather"
+    features_output_path = output_dir / "cpd_features.feather"
     # features_output_path = output_dir / f"cpd_features_aug14.feather"
 
     # Extract features with accurate CSS re-computation
@@ -4968,7 +4954,7 @@ def analyze_cproto(args, cfg, dataset_dir: Path, output_dir: Path):
         for log_id in tqdm(cproto_log_ids, desc="Extracting all features"):
             cproto_output_path = get_cproto_output_path(output_dir, log_id)
 
-            cur_features_output_path = output_dir / log_id / f"cpd_features.feather"
+            cur_features_output_path = output_dir / log_id / "cpd_features.feather"
 
             # TODO: COMMENT OUT LATER
             # if not cur_features_output_path.exists():
@@ -4994,7 +4980,8 @@ def analyze_cproto(args, cfg, dataset_dir: Path, output_dir: Path):
                 )
                 pr.disable()
 
-                import pstats, io
+                import io
+                import pstats
 
                 s = io.StringIO()
                 sortby = "cumtime"
@@ -5215,11 +5202,18 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     owlvit_log_ids = [x.name for x in owlvit_predictions_dir.iterdir()]
     print(f"{len(owlvit_log_ids)=}")
     # exit()
-    if len(owlvit_alpha_shape_log_ids) == 0:
-        # for log_id in [np.random.choice(owlvit_log_ids)]:  # TODO: do all
-        for log_id in ['b50c4763-5d1e-37f4-a009-2244aeebabcd']:
-            pr = cProfile.Profile()
-            pr.enable()
+
+    vis_log_id = None
+
+    not_done_log_ids = list(set(owlvit_log_ids).difference(owlvit_alpha_shape_log_ids))
+    print(f"not_done_log_ids {len(not_done_log_ids)}")
+
+    if len(owlvit_alpha_shape_log_ids) == 0 or True:
+        # for log_id in [np.random.choice(not_done_log_ids)]:  # TODO: do all
+        for log_id in ['42f92807-0c5e-3397-bd45-9d5303b4db2a']:
+            # pr = cProfile.Profile()
+            # pr.enable()
+            print(f"running on {log_id=}")
             alpha_shape = OWLViTAlphaShapeMFCF(
                 log_id,
                 root_path=str(output_dir),
@@ -5229,22 +5223,24 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
             )
             alpha_shape()
 
-            pr.disable()
+            vis_log_id = log_id
 
-            import pstats, io
+            # pr.disable()
 
-            s = io.StringIO()
-            sortby = "cumtime"
-            ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-            ps.print_stats()
-            with open("OWLViTAlphaShapeMFCF_cprofile.txt", "w") as f:
-                f.write(s.getvalue())
+            # import pstats, io
+
+            # s = io.StringIO()
+            # sortby = "cumtime"
+            # ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+            # ps.print_stats()
+            # with open("OWLViTAlphaShapeMFCF_cprofile.txt", "w") as f:
+            #     f.write(s.getvalue())
 
             owlvit_alpha_shape_log_ids.append(log_id)
 
     print(f"Found {len(owlvit_alpha_shape_log_ids)} owlvit_alpha_shape_log_ids")
 
-    vis_log_id = np.random.choice(owlvit_alpha_shape_log_ids)
+    vis_log_id = np.random.choice(owlvit_alpha_shape_log_ids) if vis_log_id is None else vis_log_id
     print(f"{vis_log_id=}")
 
     vis_path = get_owl_alpha_shape_output_path(output_dir, vis_log_id)
@@ -5263,7 +5259,7 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
 
     outline_infos = load_and_plot_objects(
         vis_path,
-        use_first_frame=True,  # Use frame with most objects
+        use_first_frame=False,  # Use frame with most objects
         plot_trajectories=True,
         gts_dataframe=gts.copy(),  # Add GT overlay
         save_path="owlvit_alpha_shape_box_bev_visualization.png",
@@ -5273,7 +5269,7 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     # Create BEV plot with trajectories
     outline_infos = load_and_plot_alpha_shapes(
         vis_path,
-        use_first_frame=True,  # Use frame with most objects
+        use_first_frame=False,  # Use frame with most objects
         plot_trajectories=True,
         gts_dataframe=gts.copy(),  # Add GT overlay
         save_path="owlvit_alpha_shape_bev_visualization.png",
@@ -5304,7 +5300,7 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
         "Pedestrian": SensorCompetitionCategories.PEDESTRIAN.value,
     }
 
-    features_output_path = output_dir / f"owlvit_alpha_shape_features.feather"
+    features_output_path = output_dir / "owlvit_alpha_shape_features.feather"
     # Extract features with accurate CSS re-computation
     if not features_output_path.exists():
         serialized_dts_list = []
@@ -5312,7 +5308,7 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
             cproto_output_path = get_owl_alpha_shape_output_path(output_dir, log_id)
 
             cur_features_output_path = (
-                output_dir / log_id / f"owlvit_alpha_shape_features.feather"
+                output_dir / log_id / "owlvit_alpha_shape_features.feather"
             )
 
             # TODO: COMMENT OUT LATER
@@ -5502,7 +5498,8 @@ def analyze_alpha_shape(args, cfg, dataset_dir: Path, output_dir: Path):
 
             pr.disable()
 
-            import pstats, io
+            import io
+            import pstats
 
             s = io.StringIO()
             sortby = "cumtime"
@@ -5574,7 +5571,7 @@ def analyze_alpha_shape(args, cfg, dataset_dir: Path, output_dir: Path):
         "Pedestrian": SensorCompetitionCategories.PEDESTRIAN.value,
     }
 
-    features_output_path = output_dir / f"alpha_shape_features.feather"
+    features_output_path = output_dir / "alpha_shape_features.feather"
     # Extract features with accurate CSS re-computation
     if not features_output_path.exists():
         serialized_dts_list = []
@@ -5582,7 +5579,7 @@ def analyze_alpha_shape(args, cfg, dataset_dir: Path, output_dir: Path):
             cproto_output_path = get_alpha_shape_output_path(output_dir, log_id)
 
             cur_features_output_path = (
-                output_dir / log_id / f"alpha_shape_features.feather"
+                output_dir / log_id / "alpha_shape_features.feather"
             )
 
             # TODO: COMMENT OUT LATER

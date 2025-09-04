@@ -1,75 +1,78 @@
-import cProfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import copy
+import cProfile
+import io
 import os
-from pathlib import Path
 import pickle as pkl
+import pstats
 import time
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from pprint import pprint
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import av2.geometry.polyline_utils as polyline_utils
+import av2.rendering.vector as vector_plotting_utils
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
-from tqdm import tqdm, trange
-from scipy.spatial import ConvexHull, cKDTree
-from shapely.geometry import Polygon, MultiPoint
-from shapely.ops import unary_union
-from collections import defaultdict
-from scipy.spatial.distance import cdist
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from typing import Dict, List, Tuple, Optional, Any, Union
-from scipy.optimize import linear_sum_assignment
-from kornia.geometry.linalg import transform_points
-from pprint import pprint
-import trimesh
 import PIL.Image as Image
-import io
-import pstats
-
-
-from av2.map.map_api import ArgoverseStaticMap, GroundHeightLayer
-
-from av2.map.lane_segment import LaneSegment
-import av2.rendering.vector as vector_plotting_utils
-import av2.geometry.polyline_utils as polyline_utils
+import torch
+import trimesh
 from av2.datasets.sensor.constants import RingCameras, StereoCameras
 from av2.datasets.sensor.sensor_dataloader import (
     SensorDataloader,
     SynchronizedSensorData,
 )
+from av2.geometry.camera.pinhole_camera import PinholeCamera
+from av2.map.lane_segment import LaneSegment
+from av2.map.map_api import ArgoverseStaticMap, GroundHeightLayer
 from av2.rendering.color import ColorFormats, create_range_map
 from av2.rendering.rasterize import draw_points_xy_in_img
 from av2.structures.sweep import Sweep
-from av2.utils.io import read_city_SE3_ego
-from av2.utils.io import read_ego_SE3_sensor, read_feather
-from av2.map.map_api import ArgoverseStaticMap
 from av2.structures.timestamped_image import TimestampedImage
-from av2.geometry.camera.pinhole_camera import PinholeCamera
+from av2.utils.io import read_city_SE3_ego, read_ego_SE3_sensor, read_feather
+from kornia.geometry.linalg import transform_points
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial import ConvexHull, cKDTree
+from scipy.spatial.distance import cdist
+from shapely.geometry import MultiPoint, Polygon
+from shapely.ops import unary_union
+from sklearn.cluster import DBSCAN
+from tqdm import tqdm, trange
 
-from lion.unsupervised_core.convex_hull_tracker.alpha_shape_tracker import AlphaShapeTracker
+from lion.unsupervised_core.convex_hull_tracker.alpha_shape_tracker import (
+    AlphaShapeTracker,
+)
 from lion.unsupervised_core.convex_hull_tracker.alpha_shape_utils import AlphaShapeUtils
-from lion.unsupervised_core.convex_hull_tracker.convex_hull_kalman_tracker import ConvexHullKalmanTracker
-from lion.unsupervised_core.convex_hull_tracker.convex_hull_object import ConvexHullObject
-from lion.unsupervised_core.convex_hull_tracker.convex_hull_track import ConvexHullTrackState
+from lion.unsupervised_core.convex_hull_tracker.convex_hull_kalman_tracker import (
+    ConvexHullKalmanTracker,
+)
+from lion.unsupervised_core.convex_hull_tracker.convex_hull_object import (
+    ConvexHullObject,
+)
+from lion.unsupervised_core.convex_hull_tracker.convex_hull_track import (
+    ConvexHullTrackState,
+)
 from lion.unsupervised_core.tracker.box_op import register_bbs
 
-
+from .box_utils import *
+from .file_utils import load_predictions_parallel
 from .outline_utils import (
     OutlineFitter,
     TrackSmooth,
-    voxel_sampling,
     points_rigid_transform,
+    voxel_sampling,
 )
+from .owlvit_frustum_tracker import OWLViTFrustumTracker
 from .trajectory_optimizer import (
     GlobalTrajectoryOptimizer,
     optimize_with_gtsam_timed,
     simple_pairwise_icp_refinement,
 )
 
-from .box_utils import *
-from .file_utils import load_predictions_parallel
-from .owlvit_frustum_tracker import OWLViTFrustumTracker
-from sklearn.cluster import DBSCAN
-
+PROFILING = True
 
 def filter_frustum_points_clustering(
     points_3d: np.ndarray,
@@ -351,7 +354,6 @@ class OWLViTAlphaShapeMFCF:
 
         self.min_box_iou = 0.1
         self.lidar_connected_components_eps = 0.5
-        self.connected_components_eps = 0.75
         self.min_component_points = 10
 
         self.nms_iou_threshold = 0.7
@@ -919,12 +921,14 @@ class OWLViTAlphaShapeMFCF:
 
     def _get_vision_guided_clusters(
         self,
-        aggregated_points: np.ndarray,
+        points: np.ndarray,
         traditional_clusters,
         camera_name_timestamps: List[Tuple],
         timestamp_ns: int,
         camera_models: Dict[str, PinholeCamera],
-        raster_ground_height_layer: GroundHeightLayer,
+        timestamp_city_SE3_ego_dict,
+        tracker: ConvexHullKalmanTracker,
+        lidar_tree: cKDTree
     ) -> List[Dict]:
         """
         Get vision-guided clusters by projecting LiDAR to cameras and filtering by OWLViT boxes.
@@ -933,40 +937,8 @@ class OWLViTAlphaShapeMFCF:
             List of cluster dicts with 3D points, camera info, UV alpha shapes, and semantic features
         """
         vision_clusters = []
-
-        log_dir = self.dataloader.dataset_dir / self.split / self.log_id
-        sensor_dir = log_dir / "sensors"
-        cameras_dir = sensor_dir / "cameras"
-
-        # Load city SE3 ego transformations
-        timestamp_city_SE3_ego_dict = read_city_SE3_ego(log_dir=log_dir)
-
         # ego transformation (ego -> city)
         city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[timestamp_ns]
-
-        # Find the lidar timestamps
-        lidar_folder = sensor_dir / "lidar"
-
-        if aggregated_points is None:
-            lidar_feather_path = lidar_folder / f"{timestamp_ns}.feather"
-            lidar = read_feather(lidar_feather_path)
-            pcl_ego = lidar.loc[:, ["x", "y", "z"]].to_numpy().astype(float)
-            pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
-        else:
-            pcl_ego = aggregated_points
-            pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
-
-
-        is_ground = raster_ground_height_layer.get_ground_points_boolean(
-            pcl_city_1
-        ).astype(bool)
-        print("is_ground", is_ground.shape, is_ground.sum())
-        is_not_ground = ~is_ground
-
-        pcl_city_1 = pcl_city_1[is_not_ground]
-        pcl_ego = pcl_ego[is_not_ground]
-
-        points = pcl_ego
 
         # points_orig_shape = points.shape
         # points = self.outline_estimator.remove_ground(points.copy())
@@ -989,6 +961,9 @@ class OWLViTAlphaShapeMFCF:
         num_no_box = 0
         num_w_box = 0
 
+        lidar_cmp_indices = set()
+        track_cmp_indices = set()
+
         for cmp_lbl in range(lidar_n_components):
             mask = (lidar_connected_components_labels == cmp_lbl)
 
@@ -1001,17 +976,45 @@ class OWLViTAlphaShapeMFCF:
             else:
                 vertices = np.zeros((0, 3), dtype=np.float32)
 
+            lidar_cmp_indices.add(cmp_lbl)
+
             # lidar_meshes.append(mesh)
             all_cmp_vertices.append(vertices)
             all_cmp_labels.append(np.full((len(vertices),), fill_value=cmp_lbl))
 
+        # add confirmed tracklets
+        track_ids = []
+        label_to_track_id = {}
+        track_label = lidar_n_components
+        world_to_ego = np.linalg.inv(city_SE3_ego_lidar_t.transform_matrix)
+        for track_idx, track in enumerate(tracker.tracks):
+            if not track.is_confirmed():
+                continue
+
+            assert track_idx == track.track_id
+
+            vertices = get_rotated_3d_box_corners(track.to_box())
+            vertices_ego = points_rigid_transform(vertices, world_to_ego)
+            track_ids.append(track.track_id)
+
+            label_to_track_id[track_label] = track.track_id
+
+            all_cmp_vertices.append(vertices_ego)
+            all_cmp_labels.append(np.full((len(vertices),), fill_value=track_label))
+
+            track_cmp_indices.add(track_label)
+
+
+            track_label += 1
+
+        assert track_cmp_indices.isdisjoint(lidar_cmp_indices), f"overlaps {len(track_cmp_indices.intersection(lidar_cmp_indices))} {len(track_cmp_indices)} {len(lidar_cmp_indices)}"
+
+        n_tracks = len(track_ids)
+
+        n_components = lidar_n_components + n_tracks
+
         all_cmp_vertices = np.concatenate(all_cmp_vertices, axis=0)
         all_cmp_labels = np.concatenate(all_cmp_labels)
-
-        print("all_cmp_vertices", all_cmp_vertices.shape)
-        print("all_cmp_labels", all_cmp_labels.shape)
-        print("points", points.shape)
-
 
         # filter the camera images for ones with this sweep
         sweep_camera_name_timestamps = [
@@ -1028,6 +1031,12 @@ class OWLViTAlphaShapeMFCF:
         total_boxes = sum(len(result['pred_boxes']) for result in results)
         print("total_boxes", total_boxes)
 
+        if total_boxes == 0:
+            with open('log_no_boxes.csv', 'a') as f:
+                f.write(f'{self.log_id},{timestamp_ns}')
+            print(f"WARNING: NO BOXES FOR {self.log_id=},{timestamp_ns=}")
+            print("sweep_camera_name_timestamps", sweep_camera_name_timestamps)
+            return []
         result_box_ids = []
         start = 0
         for result in results:
@@ -1038,8 +1047,8 @@ class OWLViTAlphaShapeMFCF:
             start += n_boxes
         # print("result_box_ids", result_box_ids)
 
-        iou_matrix = np.zeros((total_boxes, lidar_n_components), dtype=np.float32)
-        dist_matrix = np.full((total_boxes, lidar_n_components), fill_value=1000, dtype=np.float32)
+        iou_matrix = np.zeros((total_boxes, n_components), dtype=np.float32)
+        dist_matrix = np.full((total_boxes, n_components), fill_value=1000, dtype=np.float32)
         box_infos = {i: {} for i in range(total_boxes)}
 
         for box_ids, result in tqdm(
@@ -1075,6 +1084,15 @@ class OWLViTAlphaShapeMFCF:
 
             if not np.any(is_valid_points):
                 continue
+
+            before_clamp = np.copy(uv_points[:, :2])
+            uv_points[:, 0] = np.clip(uv_points[:, 0], 0, camera_model.width_px)
+            uv_points[:, 1] = np.clip(uv_points[:, 1], 0, camera_model.height_px)
+
+            clamp_diff = np.abs(uv_points - before_clamp)
+            clamp_diff_mask = np.any(clamp_diff>=1, axis=1)
+
+            print(f"clamp_diff_mask {clamp_diff_mask.sum()} {(clamp_diff_mask.sum()/clamp_diff_mask.shape[0]):.2f}")
 
             valid_cmp_labels = all_cmp_labels[is_valid_points]
             valid_cmp_labels = np.unique(valid_cmp_labels)
@@ -1143,6 +1161,11 @@ class OWLViTAlphaShapeMFCF:
         matches_per_component = {i: (clusters_assigned == i).sum() for i in range(lidar_n_components)}
         print(f"matches_per_component", [(k, v) for k, v in matches_per_component.items() if v > 0])
 
+        matches_per_track = {i: (clusters_assigned == i).sum() for i in range(lidar_n_components, lidar_n_components + n_tracks)}
+        print(f"matches_per_track", [(k, v) for k, v in matches_per_track.items() if v > 0])
+
+        ious_tracks = iou_matrix[:, lidar_n_components:].max(axis=0)
+        print("ious_tracks", ious_tracks)
         # for cmp_lbl, num_matched in matches_per_component.items():
         #     if num_matched == 0:
         #         continue
@@ -1158,6 +1181,45 @@ class OWLViTAlphaShapeMFCF:
 
         for box_idx, cmp_label in enumerate(clusters_assigned):
             if iou_matrix[box_idx, cmp_label] < self.min_box_iou:
+                continue
+
+            if cmp_label >= lidar_n_components:
+                print(f"TODO: match with track...  IoU: {iou_matrix[box_idx, cmp_label]:.2f} Distance: {dist_matrix[box_idx, cmp_label]:.2f}")
+
+                assert cmp_label in track_cmp_indices
+
+                box_info = box_infos[box_idx]
+                track_idx = cmp_label - lidar_n_components
+                track_id = track_ids[track_idx]
+
+                track = tracker.tracks[track_id]
+
+                pos = track.mean[:3]
+                radius = np.linalg.norm(track.lwh*0.5)
+
+                lidar_indices = lidar_tree.query_ball_point(pos, radius)
+                lidar_indices = np.array(lidar_indices, int)
+                
+                if len(lidar_indices) < self.min_component_points:
+                    continue
+
+                world_points = lidar_tree.data[lidar_indices]
+                world_points = ConvexHullObject.points_in_box(track.to_box(), world_points.copy())
+
+                if len(world_points) < self.min_component_points:
+                    continue
+
+                obj = ConvexHullObject(
+                    original_points=world_points,
+                    confidence=box_info['objectness_score'],
+                    feature=box_info['semantic_features'],
+                    timestamp=timestamp_ns,
+                    source="vision_guided"
+                )
+
+                if obj.original_points is not None:
+                    vision_clusters.append(obj)
+
                 continue
 
             box_info = box_infos[box_idx]
@@ -1178,15 +1240,6 @@ class OWLViTAlphaShapeMFCF:
             component_3d_points = points[component_mask].copy()
 
             num_w_box += 1
-            # add first with entire cluster
-            # alpha_shape = AlphaShapeUtils.compute_alpha_shape(component_3d_points)
-            # vision_clusters.append(
-            #     {
-            #         "original_points": component_3d_points,
-            #         **box_info,
-            #         **alpha_shape
-            #     }
-            # )
 
             component_3d_points_city = city_SE3_ego_lidar_t.transform_point_cloud(
                 component_3d_points
@@ -1230,29 +1283,20 @@ class OWLViTAlphaShapeMFCF:
                 component_3d_points = component_3d_points[in_box_mask].copy()
 
             # TODO: potentially do filtering with boxes again.....
+            in_box_prop = in_box_mask.sum() / max(1, len(in_box_mask))
+            print("in_box_prop", in_box_prop)
 
             clusters_assigned_set.add(cmp_label)
 
-            alpha_shape = AlphaShapeUtils.compute_alpha_shape(component_3d_points)
-
-            if alpha_shape is None:
-                continue
-
             num_w_box += 1
-            # add second time with constrained part of cluster to bbox
-            # vision_clusters.append(
-            #     {
-            #         "original_points": component_3d_points,
-            #         **box_info,
-            #         **alpha_shape
-            #     }
-            # )
+
+            if in_box_prop > 0.5:
+                # don't add subsequent if mostly aligns?
+                continue
+            
             component_3d_points_city = city_SE3_ego_lidar_t.transform_point_cloud(
                 component_3d_points
             )
-
-            # print(f"component_3d_points[0]={component_3d_points[0]}")
-            # print(f"component_3d_points_city[0]={component_3d_points_city[0]}")
 
             obj = ConvexHullObject(
                 original_points=component_3d_points_city,
@@ -1313,228 +1357,7 @@ class OWLViTAlphaShapeMFCF:
             
 
         total = num_w_box + num_no_box
-        print(f"{num_no_box=} ({num_no_box/total}) {num_w_box=} {num_w_box/total}")
-
-        return vision_clusters
-
-    def _get_vision_guided_clusters_separate(
-        self,
-        aggregated_points: np.ndarray,
-        traditional_clusters,
-        camera_name_timestamps: List[Tuple],
-        timestamp_ns: int,
-        camera_models: Dict[str, PinholeCamera],
-        raster_ground_height_layer: GroundHeightLayer,
-    ) -> List[Dict]:
-        """
-        Get vision-guided clusters by projecting LiDAR to cameras and filtering by OWLViT boxes.
-
-        Returns:
-            List of cluster dicts with 3D points, camera info, UV alpha shapes, and semantic features
-        """
-        vision_clusters = []
-
-        log_dir = self.dataloader.dataset_dir / self.split / self.log_id
-        sensor_dir = log_dir / "sensors"
-        cameras_dir = sensor_dir / "cameras"
-
-        # Load city SE3 ego transformations
-        timestamp_city_SE3_ego_dict = read_city_SE3_ego(log_dir=log_dir)
-
-        # ego transformation (ego -> city)
-        city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[timestamp_ns]
-
-        # Find the lidar timestamps
-        lidar_folder = sensor_dir / "lidar"
-
-        if aggregated_points is None:
-            lidar_feather_path = lidar_folder / f"{timestamp_ns}.feather"
-            lidar = read_feather(lidar_feather_path)
-            pcl_ego = lidar.loc[:, ["x", "y", "z"]].to_numpy().astype(float)
-            pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
-        else:
-            pcl_ego = aggregated_points
-            pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
-
-
-        is_ground = raster_ground_height_layer.get_ground_points_boolean(
-            pcl_city_1
-        ).astype(bool)
-        print("is_ground", is_ground.shape, is_ground.sum())
-        is_not_ground = ~is_ground
-
-        pcl_city_1 = pcl_city_1[is_not_ground]
-        pcl_ego = pcl_ego[is_not_ground]
-
-        points = pcl_ego
-
-        # points_orig_shape = points.shape
-        # points = self.outline_estimator.remove_ground(points.copy())
-        # is_ground = raster_ground_height_layer.get_ground_points_boolean(points).astype(bool)
-        # is_not_ground = ~is_ground
-
-        # points = points[is_not_ground]
-        # print(f"before ground removal: {points_orig_shape} after: {points.shape}")
-
-        # filter the camera images for ones with this sweep
-        sweep_camera_name_timestamps = [
-            (camera_name, cam_timestamp_ns)
-            for camera_name, cam_timestamp_ns, sweep_timestamp_ns in camera_name_timestamps
-            if sweep_timestamp_ns == timestamp_ns
-        ]
-
-        owlvit_pred_dir = self.owlvit_predictions_dir / self.log_id
-
-        for camera_name, cam_timestamp_ns in tqdm(
-            sweep_camera_name_timestamps,
-            desc="_get_vision_guided_clusters: iterating over camera_predictions",
-        ):  # TODO remove :30
-            owlvit_pred_path = owlvit_pred_dir / f"{cam_timestamp_ns}_{camera_name}.pkl"
-
-            with open(owlvit_pred_path, "rb") as f:
-                prediction = pkl.load(f)
-
-            pred_boxes = prediction["pred_boxes"]
-            image_class_embeds = prediction["image_class_embeds"]
-            objectness_scores = prediction["objectness_scores"]
-            assert len(pred_boxes) == len(image_class_embeds) == len(objectness_scores)
-
-            if len(pred_boxes) == 0:
-                continue
-
-            camera_model = camera_models[camera_name]
-            city_SE3_ego_cam_t = timestamp_city_SE3_ego_dict[cam_timestamp_ns]
-
-            if city_SE3_ego_cam_t is None or city_SE3_ego_lidar_t is None:
-                continue
-
-            (
-                uv_points,
-                _,
-                is_valid_points,
-            ) = camera_model.project_ego_to_img_motion_compensated(
-                points,
-                city_SE3_ego_cam_t=city_SE3_ego_cam_t,
-                city_SE3_ego_lidar_t=city_SE3_ego_lidar_t,
-            )
-
-            if not np.any(is_valid_points):
-                continue
-
-            valid_uv = uv_points[is_valid_points]
-            # valid_points_cam = points_cam[is_valid_points]
-            valid_3d_points = points[is_valid_points]
-            # valid_city_points = pcl_city_1[is_valid_points]
-
-            # For each OWLViT detection box
-            for box_idx, box, semantic_features, objectness_score in zip(
-                np.arange(len(pred_boxes)),
-                pred_boxes,
-                image_class_embeds,
-                objectness_scores,
-            ):
-                x1, y1, x2, y2 = box
-
-                # Find points within this box
-                in_box_mask = (
-                    (valid_uv[:, 0] >= x1)
-                    & (valid_uv[:, 0] <= x2)
-                    & (valid_uv[:, 1] >= y1)
-                    & (valid_uv[:, 1] <= y2)
-                )
-
-                if np.sum(in_box_mask) >= self.min_component_points:  # Need at least 3 points
-                    box_3d_points = valid_3d_points[in_box_mask]
-                    # box_city_points = valid_city_points[in_box_mask]
-                    box_uv_points = valid_uv[in_box_mask]
-                    # box_cam_points = valid_points_cam[in_box_mask]
-
-                    # connected components
-                    # t0 = time.time()
-                    # component_labels, n_components = find_connected_components_lidar(box_3d_points)
-                    # t1 = time.time()
-                    # assert component_labels.min() >= 0 and component_labels.max() < n_components, f"{n_components=} {component_labels.min()} {component_labels.max()}"
-
-                    # bench0 = t1 - t0
-
-                    # filtered_component_labels = component_labels
-                    unique_uv = box_uv_points[:, :2]
-
-                    component_labels, n_components = fast_connected_components(
-                        box_3d_points, eps=self.connected_components_eps
-                    )
-                    filtered_component_labels = component_labels
-
-                    # rounded_uv = np.round(box_uv_points[:, :2]).astype(int)
-
-                    # # Find unique (u,v) coordinates and their indices
-                    # unique_uv, unique_indices = np.unique(
-                    #     rounded_uv, axis=0, return_index=True
-                    # )
-
-                    # # Apply mask to keep only unique points
-                    # filtered_component_labels = component_labels[unique_indices]
-
-                    component_boxes = []
-                    for i in range(n_components):
-                        mask = filtered_component_labels == i
-
-                        if mask.sum() == 0:
-                            component_boxes.append(np.zeros((4,), dtype=np.float32))
-                            continue
-
-                        component_uv_points = unique_uv[mask]
-
-                        xy1 = component_uv_points.min(axis=0)
-                        xy2 = component_uv_points.max(axis=0)
-
-                        component_boxes.append(
-                            np.concatenate([xy1, xy2], axis=0).astype(np.float32)
-                        )
-
-                    component_boxes = np.stack(component_boxes, axis=0)
-
-                    ious = box_iou(box.reshape(1, 4), component_boxes.reshape(-1, 4))
-                    ious = ious[0, :]
-
-                    valid_components = np.where(ious >= self.min_box_iou)[0]
-
-                    for component in valid_components:
-                        # revise with this component
-                        in_component_mask = component_labels == component
-
-                        if np.sum(in_box_mask) < self.min_component_points:  # Need at least 3 points
-                            continue
-
-                        component_3d_points = box_3d_points[in_component_mask].copy()
-
-                        dims_mins = np.min(component_3d_points, axis=0)
-                        dims_maxes = np.max(component_3d_points, axis=0)
-
-                        lwh = dims_maxes - dims_mins
-
-                        # if (
-                        #     np.any(lwh > 30.0)
-                        #     or np.prod(lwh) > 200
-                        #     or np.prod(lwh) < 0.1
-                        #     or np.any(lwh < 0.05)
-                        # ):
-                        #     continue
-
-                        vision_clusters.append(
-                            {
-                                "original_points": component_3d_points,
-                                # "uv_points": box_uv_points,
-                                "camera_name": camera_name,
-                                "camera_timestamp": timestamp_ns,
-                                "box_2d": box,
-                                "box_idx": box_idx,
-                                "source": "vision_guided",
-                                "semantic_features": semantic_features,  # CLIP embeddings from OWLViT
-                                "objectness_score": objectness_score,  # Confidence score
-                                "has_semantic_features": semantic_features is not None,
-                            }
-                        )
+        print(f"{num_no_box=} ({num_no_box/total}) {num_w_box=} {num_w_box/max(total,1)}")
 
         return vision_clusters
 
@@ -1875,6 +1698,8 @@ class OWLViTAlphaShapeMFCF:
         camera_name_timestamps: List[Tuple] = self._load_camera_name_timestamps()
 
         log_dir = self.dataloader.dataset_dir / self.split / self.log_id
+        sensor_dir = log_dir / "sensors"
+        cameras_dir = sensor_dir / "cameras"
 
         # Load camera models for each
         camera_models = {
@@ -1890,7 +1715,7 @@ class OWLViTAlphaShapeMFCF:
 
         tracker = ConvexHullKalmanTracker(debug=True)
 
-        for i in trange(min(1000, len(infos)), desc=f"Generating hybrid alpha shapes"):
+        for i in trange(min(20, len(infos)), desc=f"Generating hybrid alpha shapes"):
             # 1. Load temporal LiDAR window
             aggregated_points = None
             aggregated_points, cur_points = self._load_temporal_lidar_window(i, infos)
@@ -1898,27 +1723,63 @@ class OWLViTAlphaShapeMFCF:
             pose = infos[i]['pose']
 
             # 2. Load OWLViT predictions for all cameras (exhaustive)
-            target_timestamp = infos[i].get(
+            timestamp_ns = infos[i].get(
                 "timestamp_ns", None
             )  # Fallback if no timestamp
-            assert target_timestamp is not None, infos[i].keys()
+            assert timestamp_ns is not None, infos[i].keys()
 
             # 3. Generate both cluster types
             # traditional_clusters = self._get_traditional_clusters(aggregated_points)
             traditional_clusters = []  # TODO: for testing
-            if i == 0:
+            if i == 0 and PROFILING:
                 pr = cProfile.Profile()
                 pr.enable()
+            tracker.predict(timestamp_ns)
+
+
+            # Load city SE3 ego transformations
+            timestamp_city_SE3_ego_dict = read_city_SE3_ego(log_dir=log_dir)
+
+            # ego transformation (ego -> city)
+            city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[timestamp_ns]
+
+            # Find the lidar timestamps
+            lidar_folder = sensor_dir / "lidar"
+
+            if aggregated_points is None:
+                lidar_feather_path = lidar_folder / f"{timestamp_ns}.feather"
+                lidar = read_feather(lidar_feather_path)
+                pcl_ego = lidar.loc[:, ["x", "y", "z"]].to_numpy().astype(float)
+                pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
+            else:
+                pcl_ego = aggregated_points
+                pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
+
+            # TODO cache
+            is_ground = raster_ground_height_layer.get_ground_points_boolean(
+                pcl_city_1
+            ).astype(bool)
+            is_not_ground = ~is_ground
+
+            pcl_city_1 = pcl_city_1[is_not_ground]
+            pcl_ego = pcl_ego[is_not_ground]
+
+            # create lidar tree
+            lidar_tree = cKDTree(pcl_city_1)
+
+            # TODO: project tracks and see if align with boxes...
             vision_guided_clusters = self._get_vision_guided_clusters(
-                aggregated_points,
+                pcl_ego,
                 traditional_clusters,
                 camera_name_timestamps,
-                target_timestamp,
+                timestamp_ns,
                 camera_models,
-                raster_ground_height_layer,
+                timestamp_city_SE3_ego_dict,
+                tracker,
+                lidar_tree
             )
 
-            if i == 0:
+            if i == 0 and PROFILING:
                 pr.disable()
 
                 s = io.StringIO()
@@ -1933,12 +1794,11 @@ class OWLViTAlphaShapeMFCF:
                     f"Frame {i}: {len(traditional_clusters)} traditional, {len(vision_guided_clusters)} vision-guided clusters"
                 )
 
-            if i > 0:
+            if i > 0 and PROFILING:
                 pr = cProfile.Profile()
                 pr.enable()
-            tracker.predict(target_timestamp)
-            tracker.update(vision_guided_clusters, infos[i]['pose'], target_timestamp)
-            if i > 0:
+            tracker.update(vision_guided_clusters, infos[i]['pose'], lidar_tree)
+            if i > 0 and PROFILING:
                 pr.disable()
 
                 s = io.StringIO()
@@ -1995,6 +1855,7 @@ class OWLViTAlphaShapeMFCF:
 
             for track in tracks:
                 box = track.to_box()
+                # box = track.last_box
                 center_xy = box[:2]
                 length = box[3]
                 width = box[4]
@@ -2102,7 +1963,7 @@ class OWLViTAlphaShapeMFCF:
             infos[i]["outline_cls"] = []
             infos[i]["outline_dif"] = []
             infos[i]["alpha_shapes"] = []   
-            infos[i]["tracked_objects"] = copy.deepcopy(tracker.tracks)
+            infos[i]["outline_poses"] = []
 
 
         non_none = set()
@@ -2125,15 +1986,16 @@ class OWLViTAlphaShapeMFCF:
                 mesh = trimesh.convex.convex_hull(ego_points)
 
                 # box = apply_pose_to_box(world_to_ego, box)
-                print("world box", box)
-                box = register_bbs(box.reshape(1, 7), world_to_ego)[0]
-                print("ego box", box)
+                # print("world box", box)
+                # box = register_bbs(box.reshape(1, 7), world_to_ego)[0]
+                # print("ego box", box)
 
                 infos[frame_id]["outline_box"].append(box)
                 infos[frame_id]["outline_ids"].append(track.track_id)
                 infos[frame_id]["outline_cls"].append(track.source)
                 infos[frame_id]["outline_dif"].append(1)
                 infos[frame_id]["alpha_shapes"].append({'vertices_3d': mesh.vertices})
+                infos[frame_id]["outline_poses"].append(pose)
 
         print(f"{non_none=}")
 

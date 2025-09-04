@@ -1,9 +1,15 @@
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
-from typing import Dict, List, Tuple, Optional, Any, Union
 
-def analytical_y_rotation(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+from lion.unsupervised_core.outline_utils import voxel_sampling
+
+
+def analytical_y_rotation(
+    A: np.ndarray, B: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Analytical least squares solution for y-axis rotation only.
     """
@@ -25,21 +31,25 @@ def analytical_y_rotation(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.
     # Construct rotation matrix
     cos_theta = np.cos(theta)
     sin_theta = np.sin(theta)
-    R = np.array([
-        [cos_theta,  0, sin_theta],
-        [0,          1, 0        ],
-        [-sin_theta, 0, cos_theta]
-    ])
+    R = np.array([[cos_theta, 0, sin_theta], [0, 1, 0], [-sin_theta, 0, cos_theta]])
 
     # Translation
     t = centroid_B - R @ centroid_A
 
     return R, t, theta
 
-def rigid_icp(points1: np.ndarray, points2: np.ndarray, tolerance: float = 0.1, max_iterations=10, debug: bool = False, relative:bool =True):
+
+def rigid_icp(
+    points1: np.ndarray,
+    points2: np.ndarray,
+    tolerance: float = 0.1,
+    max_iterations=10,
+    debug: bool = False,
+    relative: bool = True,
+):
     # Center both point clouds by the same reference point (centroid of points1)
     centroid_A = np.mean(points1, axis=0)
-    
+
     A = np.copy(points1) - centroid_A
     B = np.copy(points2) - centroid_A  # Note: both centered by same point
 
@@ -61,7 +71,7 @@ def rigid_icp(points1: np.ndarray, points2: np.ndarray, tolerance: float = 0.1, 
     #         print("init R, t", np.round(R, 2), np.round(t, 2))
 
     #     A_indices = np.arange(len(A))
-        
+
     #     # Convert back: t_final_orig = t_final + centroid_A - R_final @ centroid_A
     #     # t_final_orig = t_final + centroid_A - R_final @ centroid_A
     #     return R_final, t_final, A_indices, B_indices, init_distances.mean()
@@ -81,7 +91,10 @@ def rigid_icp(points1: np.ndarray, points2: np.ndarray, tolerance: float = 0.1, 
         if debug:
             print(f"rigid_icp {i=} mean_error={mean_error:.2f}")
 
-        if np.abs(prev_error - mean_error) < tolerance or np.abs(mean_error) < tolerance:
+        if (
+            np.abs(prev_error - mean_error) < tolerance
+            or np.abs(mean_error) < tolerance
+        ):
             break
         prev_error = mean_error
 
@@ -118,7 +131,9 @@ def rigid_icp(points1: np.ndarray, points2: np.ndarray, tolerance: float = 0.1, 
     A_indices = np.arange(len(A_final))
 
     if debug:
-        print(f"final distances {distances.min():.6f} {distances.mean():.6f} {distances.max():.6f}")
+        print(
+            f"final distances {distances.min():.6f} {distances.mean():.6f} {distances.max():.6f}"
+        )
         print(f"original translation magnitude: {np.linalg.norm(centroid_A):.6f}")
         print(f"centroid_A: {np.round(centroid_A, 2)}")
         print(f"centroid_b {np.round(np.mean(points2, axis=0), 2)}")
@@ -134,150 +149,224 @@ def rigid_icp(points1: np.ndarray, points2: np.ndarray, tolerance: float = 0.1, 
     else:
         return R_final, t_original, A_indices, B_indices, final_err
 
-def relative_object_pose(points1: np.ndarray, points2: np.ndarray, tolerance: float = 0.1, max_iterations=10, debug: bool = False):
+
+def hungarian_matching(points1, points2):
+    """One-to-one matching using Hungarian algorithm"""
+    # Compute distance matrix
+    distances = np.linalg.norm(points1[:, np.newaxis] - points2[np.newaxis, :], axis=2)
+
+    # Hungarian assignment
+    row_indices, col_indices = linear_sum_assignment(distances)
+
+    distances = distances[row_indices, col_indices]
+
+    return row_indices, col_indices, distances
+
+
+def bidirectional_matching(points1, points2):
+    """Mutual nearest neighbor matching"""
+    if len(points1) == 0 or len(points2) == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    tree1 = cKDTree(points1)
+    tree2 = cKDTree(points2)
+
+    # Forward matching: points1 -> points2
+    distances_1to2, indices_1to2 = tree2.query(points1)
+
+    # Backward matching: points2 -> points1
+    distances_2to1, indices_2to1 = tree1.query(points2)
+
+    # Find mutual matches
+    mutual_matches = []
+    mutual_distances = []
+
+    for i, (j, dist) in enumerate(zip(indices_1to2, distances_1to2)):
+        if indices_2to1[j] == i:  # Mutual nearest neighbors
+            mutual_matches.append((i, j))
+            mutual_distances.append(dist)
+
+    if mutual_matches:
+        row_indices, col_indices = zip(*mutual_matches)
+        return np.array(row_indices), np.array(col_indices), np.array(mutual_distances)
+    else:
+        return np.array([]), np.array([]), np.array([])
+
+
+def relative_object_pose(
+    points1: np.ndarray,
+    points2: np.ndarray,
+    tolerance: float = 0.1,
+    max_iterations=10,
+    debug: bool = False,
+    hungarian: bool =True
+):
     """
     ICP for pre-centered points (assumes both clouds centered at origin)
     """
     A = np.copy(points1)
     B = np.copy(points2)
-    
+
+    # simplify
+    A = voxel_sampling(A, 0.05, 0.05, 0.05)
+    B = voxel_sampling(B, 0.05, 0.05, 0.05)
+
     # Check if points are actually centered
     centroid_A = np.mean(A, axis=0)
     centroid_B = np.mean(B, axis=0)
-    
+
     if np.linalg.norm(centroid_A) > 0.1 or np.linalg.norm(centroid_B) > 0.1:
         if debug:
             print(f"Warning: Points not centered! A: {centroid_A}, B: {centroid_B}")
-    
+
     prev_error = float("inf")
-    
+
     # Track transformation as 4x4 matrix for clarity
     T_final = np.eye(4)
-    
-    tree = cKDTree(B)
-    
+
+    matching_func = hungarian_matching if hungarian else bidirectional_matching
+
     for i in range(max_iterations):
-        distances, indices = tree.query(A)
-        
+        # distances, indices = tree.query(A)
+        A_indices, B_indices, distances = matching_func(A, B)
+
+        A_, B_ = A[A_indices], B[B_indices]
+
         # Modified analytical_y_rotation for centered points
-        R, t = analytical_y_rotation_centered(A, B[indices])
-        
+        R, t = analytical_y_rotation_centered(A_, B_)
+
         # Update transformation matrix
         T_iter = np.eye(4)
         T_iter[:3, :3] = R
         T_iter[:3, 3] = t
         T_final = T_iter @ T_final
-        
+
         # Apply transformation
         A = (R @ A.T).T + t
-        
+
         mean_error = np.mean(distances)
         if debug:
             print(f"rigid_icp {i=} mean_error={mean_error:.2f}")
-        
+
         if np.abs(prev_error - mean_error) < tolerance:
             break
         prev_error = mean_error
-    
+
     # Extract final R and t
     R_final = T_final[:3, :3]
     t_final = T_final[:3, 3]
-    
+
     # Verify
     A_final = (R_final @ points1.T).T + t_final
-    tree_orig = cKDTree(points2)
-    distances, B_indices = tree_orig.query(A_final)
-    A_indices = np.arange(len(A_final))
-    
+    # tree_orig = cKDTree(points2)
+    # distances, B_indices = tree_orig.query(A_final)
+    # A_indices = np.arange(len(A_final))
+    A_indices, B_indices, distances = matching_func(A_final, points2)
+
+    distance_threshold = np.percentile(distances, 75)  # Top 75% closest points
+
+    distance_threshold = max(distance_threshold, 0.1)
+
+    inlier_mask = distances <= distance_threshold
+    A_indices = np.where(inlier_mask)[0]
+    B_indices = B_indices[inlier_mask]
+
     if debug:
-        print(f"final distances {distances.min():.6f} {distances.mean():.6f} {distances.max():.6f}")
-    
+        print(
+            f"final distances {distances.min():.6f} {distances.mean():.6f} {distances.max():.6f}"
+        )
+
     final_err = distances.mean()
-    
+
     return R_final, t_final, A_indices, B_indices, final_err
 
 
-def analytical_y_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def analytical_y_rotation_centered(
+    A: np.ndarray, B: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Y-axis rotation for already-centered points.
     """
     # DON'T re-center if points are already centered!
     # Just use them directly
-    
+
     # Extract x and z coordinates for y-axis rotation
     Ax, Az = A[:, 0], A[:, 2]
     Bx, Bz = B[:, 0], B[:, 2]
-    
+
     # Analytical solution for optimal theta
     numerator = np.sum(Bx * Az - Bz * Ax)
     denominator = np.sum(Bx * Ax + Bz * Az)
     theta = np.arctan2(numerator, denominator)
-    
+
     # Construct rotation matrix
     cos_theta = np.cos(theta)
     sin_theta = np.sin(theta)
-    R = np.array([
-        [cos_theta,  0, sin_theta],
-        [0,          1, 0        ],
-        [-sin_theta, 0, cos_theta]
-    ])
-    
+    R = np.array([[cos_theta, 0, sin_theta], [0, 1, 0], [-sin_theta, 0, cos_theta]])
+
     # For centered points, translation is just the difference after rotation
     A_rotated = (R @ A.T).T
     t = np.mean(B - A_rotated, axis=0)
-    
+
     return R, t
 
 
-def relative_object_rotation(points1: np.ndarray, points2: np.ndarray, tolerance: float = 0.1, max_iterations=10, debug: bool = False):
+def relative_object_rotation(
+    points1: np.ndarray,
+    points2: np.ndarray,
+    tolerance: float = 0.1,
+    max_iterations=10,
+    debug: bool = False,
+):
     """
     ICP for pre-centered points (assumes both clouds centered at origin)
     """
     A = np.copy(points1)
     B = np.copy(points2)
-    
+
     # Check if points are actually centered
     centroid_A = np.mean(A, axis=0)
     centroid_B = np.mean(B, axis=0)
-    
+
     if np.linalg.norm(centroid_A) > 0.1 or np.linalg.norm(centroid_B) > 0.1:
         if debug:
             print(f"Warning: Points not centered! A: {centroid_A}, B: {centroid_B}")
-    
+
     prev_error = float("inf")
-    
+
     # Track transformation as 4x4 matrix for clarity
     R_final = np.eye(3)
-    
+
     tree = cKDTree(B)
-    
+
     for i in range(max_iterations):
         distances, indices = tree.query(A)
-        
+
         # Modified analytical_y_rotation for centered points
         R, _ = analytical_y_rotation_centered(A, B[indices])
-        
+
         # Update transformation matrix
         R_final = R @ R_final
-        
+
         # Apply transformation
         A = (R @ A.T).T
-        
+
         mean_error = np.mean(distances)
         if debug:
             print(f"rigid_icp {i=} mean_error={mean_error:.2f}")
-        
+
         if np.abs(prev_error - mean_error) < tolerance:
             break
         prev_error = mean_error
-    
+
     # Verify
     A_final = (R_final @ points1.T).T
     tree_orig = cKDTree(points2)
     distances, B_indices = tree_orig.query(A_final)
-    
+
     if debug:
-        print(f"final distances {distances.min():.6f} {distances.mean():.6f} {distances.max():.6f}")
-    
-    
+        print(
+            f"final distances {distances.min():.6f} {distances.mean():.6f} {distances.max():.6f}"
+        )
+
     return R_final

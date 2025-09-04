@@ -271,7 +271,7 @@ class PoseKalmanFilter(object):
 
     @staticmethod
     def box_to_pose_vector(box: np.ndarray):
-        return np.array([box[0], box[1], box[2], 0.0, box[-1], 0.0], dtype=np.float32)
+        return np.array([box[0], box[1], box[2], 0.0, 0.0, box[-1]], dtype=np.float32)
 
     @staticmethod
     def pose_vector_to_transform(pose_vector):

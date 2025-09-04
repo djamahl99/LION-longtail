@@ -106,6 +106,111 @@ def optimize_with_gtsam_timed(initial_poses, constraints, timestamps_ns):
     
     return optimized_poses, marginals, quality
 
+def optimize_with_gtsam_timed_positions(initial_positions, constraints, timestamps_ns):
+    """
+    Optimize poses with constraints: only yaw rotation allowed (rx=0, ry=0)
+    
+    Args:
+        initial_positions: List of 3D positions [x, y, z]
+        constraints: List of dicts with 'frame_i', 'frame_j', 'relative_pose', 'confidence'
+        timestamps_ns: List of timestamps in nanoseconds
+    """
+    n_poses = len(initial_positions)
+    timestamps = np.array(timestamps_ns) * 1e-9
+    
+    # 1. Create factor graph
+    graph = gtsam.NonlinearFactorGraph()
+    initial_estimate = gtsam.Values()
+    
+    # 2. Create initial poses with zero pitch/roll, initial yaw=0
+    for i, position in enumerate(initial_positions):
+        pose = np.eye(4)
+        pose[:3, 3] = position
+        # Start with yaw=0, let GTSAM optimize it
+        initial_estimate.insert(i, gtsam.Pose3(pose))
+    
+    # 3. Prior on first pose position and zero pitch/roll, loose yaw
+    prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+        np.array([0.001, 0.001, 0.5, 0.001, 0.001, 0.001])  # Loose on rz (yaw)
+    )
+    graph.add(gtsam.PriorFactorPose3(0, gtsam.Pose3(initial_estimate.atPose3(0).matrix()), prior_noise))
+    
+    # 4. Add relative pose constraints from ICP
+    for constraint in constraints:
+        i, j = constraint['frame_i'], constraint['frame_j']
+        relative_pose = gtsam.Pose3(constraint['relative_pose'])
+        confidence = constraint['confidence']
+        
+        dt = abs(timestamps[j] - timestamps[i])
+        time_factor = 1.0 + dt * 0.1
+        base_sigma = 1.0 / (confidence + 1e-6)
+        
+        rot_sigma = base_sigma * time_factor * 0.1
+        trans_sigma = base_sigma * time_factor * 0.01
+        
+        noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([rot_sigma, rot_sigma, rot_sigma,
+                     trans_sigma, trans_sigma, trans_sigma])
+        )
+        
+        graph.add(gtsam.BetweenFactorPose3(i, j, relative_pose, noise))
+    
+    # 5. ENFORCE: Add strong priors to keep rx=0, ry=0 for ALL poses
+    zero_pitch_roll_noise = gtsam.noiseModel.Diagonal.Sigmas(
+        np.array([0.001, 0.001, 10.0, 0.1, 0.1, 0.1])  # Very tight on rx,ry; loose on rz,x,y,z
+    )
+    
+    for i in range(1, n_poses):  # Skip first pose (already has prior)
+        # Create pose with zero pitch/roll at current position
+        zero_pitch_roll_pose = np.eye(4)
+        zero_pitch_roll_pose[:3, 3] = initial_positions[i]
+        
+        graph.add(gtsam.PriorFactorPose3(i, gtsam.Pose3(zero_pitch_roll_pose), zero_pitch_roll_noise))
+    
+    # 6. Optimize
+    params = gtsam.LevenbergMarquardtParams()
+    params.setRelativeErrorTol(1e-5)
+    params.setAbsoluteErrorTol(1e-5)
+    params.setMaxIterations(100)
+    params.setVerbosityLM("SILENT")
+    
+    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_estimate, params)
+    result = optimizer.optimize()
+    
+    # 7. Extract optimized poses and enforce rx=ry=0
+    optimized_poses = []
+    for i in range(len(initial_positions)):
+        optimized_pose = result.atPose3(i)
+        pose_matrix = optimized_pose.matrix()
+        
+        optimized_poses.append(pose_matrix)
+
+        # # FORCE: Extract only yaw and reconstruct pose
+        # rotation_matrix = pose_matrix[:3, :3]
+        # yaw = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+        
+        # # Reconstruct with only yaw rotation
+        # cos_yaw = np.cos(yaw)
+        # sin_yaw = np.sin(yaw)
+        # clean_pose = np.eye(4)
+        # clean_pose[:3, :3] = np.array([
+        #     [cos_yaw, -sin_yaw, 0],
+        #     [sin_yaw,  cos_yaw, 0],
+        #     [0,        0,       1]
+        # ])
+        # clean_pose[:3, 3] = initial_positions[i]  # Use exact geometric center
+        
+        # optimized_poses.append(clean_pose)
+    
+    # 8. Calculate quality metrics
+    marginals = gtsam.Marginals(graph, result)
+    quality = {
+        'initial_error': graph.error(initial_estimate),
+        'final_error': graph.error(result),
+        'iterations': optimizer.iterations()
+    }
+    
+    return optimized_poses, marginals, quality
 
 def add_temporal_smoothness(graph, initial_poses, timestamps):
     """
@@ -213,7 +318,7 @@ class GlobalTrajectoryOptimizer:
     """
     
     def __init__(self, max_icp_iterations=50, stagger_step=2, max_stagger_gap=5):
-        self.max_icp_iterations = max_icp_iterations
+        self.icp_max_iterations = max_icp_iterations
         self.stagger_step = stagger_step  # For staggered pairs (0-2, 1-3, etc.)
         self.max_stagger_gap = max_stagger_gap
         
@@ -287,7 +392,7 @@ class GlobalTrajectoryOptimizer:
             # Your existing ICP function
             R, t, A_inliers, B_inliers = icp(
                 cur_points, next_points, 
-                max_iterations=self.max_icp_iterations,
+                max_iterations=self.icp_max_iterations,
                 return_inliers=True,
                 ret_err=False
             )
@@ -336,7 +441,7 @@ class GlobalTrajectoryOptimizer:
                 # Run ICP
                 R, t, A_inliers, B_inliers = icp(
                     transformed_cur, target_points,
-                    max_iterations=self.max_icp_iterations,
+                    max_iterations=self.icp_max_iterations,
                     return_inliers=True, 
                     ret_err=False
                 )
@@ -498,7 +603,7 @@ class GlobalTrajectoryOptimizer:
             if len(cur_inliers) > 10 and len(next_inliers) > 10:  # Minimum points needed
                 R, t, _, _ = icp(
                     cur_inliers, next_inliers,
-                    max_iterations=self.max_icp_iterations,
+                    max_iterations=self.icp_max_iterations,
                     return_inliers=True,
                     ret_err=False
                 )
