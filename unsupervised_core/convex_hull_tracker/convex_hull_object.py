@@ -2,6 +2,9 @@ import numpy as np
 import trimesh
 
 from lion.unsupervised_core.box_utils import get_rotated_3d_box_corners
+from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
+    voxel_sampling_fast,
+)
 from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import (
     PoseKalmanFilter,
 )
@@ -12,6 +15,8 @@ MAX_POINTS = 1024
 class ConvexHullObject(object):
     original_points: np.ndarray = None
     confidence: float
+    objectness_score: float
+    iou_2d: float
     feature: np.ndarray
     timestamp: int
     source: str
@@ -20,6 +25,8 @@ class ConvexHullObject(object):
         self,
         original_points: np.ndarray,
         confidence: float,
+        iou_2d: float,
+        objectness_score: float,
         feature: np.ndarray,
         timestamp: int,
         source: str = "vision_guided",
@@ -48,21 +55,33 @@ class ConvexHullObject(object):
         elif sorted_dims[1] < 0.05:  # Second dimension must be at least 5cm
             print(f"ConvexHullObject: Second dimension must be at least 5cm {lwh=}")
             return None
+        elif sorted_dims[2] > 20: 
+            print(f"ConvexHullObject: Last dimension must be less than 20 metres {lwh=}")
+            return None
 
         if len(original_points) > MAX_POINTS:
             orig_len = len(original_points)
-            indices = np.random.randint(0, orig_len, size=MAX_POINTS)
-            original_points = original_points[indices]
+
+            sampled_points = voxel_sampling_fast(original_points)
+            cur_len = len(sampled_points)
+
+            indices = np.random.randint(0, cur_len, size=MAX_POINTS)
+            original_points = sampled_points[indices]
             print(f"Resampled original_points {orig_len} -> {len(original_points)}")
+
+        if len(original_points) < 10:
+            return None
 
         self.original_points = original_points.copy()
         self.confidence = confidence
+        self.iou_2d = iou_2d
+        self.objectness_score = objectness_score
         self.feature = feature.copy()
         self.timestamp = timestamp
         self.source = source
 
         self.mesh = trimesh.convex.convex_hull(self.original_points)
-        self.box = ConvexHullObject.points_to_bounding_box(self.original_points, centre=self.mesh.centroid)
+        self.box = ConvexHullObject.points_to_bounding_box(self.mesh.vertices, centre=self.mesh.centroid)
         self.centroid_3d = self.box[:3]
         self.pose_vector = PoseKalmanFilter.box_to_pose_vector(self.box)
 

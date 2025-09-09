@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import av2.geometry.polyline_utils as polyline_utils
 import av2.rendering.vector as vector_plotting_utils
+import cv2
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
@@ -37,7 +38,7 @@ from kornia.geometry.linalg import transform_points
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.distance import cdist
-from shapely.geometry import MultiPoint, Polygon
+from shapely.geometry import MultiPoint, Polygon, box
 from shapely.ops import unary_union
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm, trange
@@ -55,6 +56,9 @@ from lion.unsupervised_core.convex_hull_tracker.convex_hull_object import (
 from lion.unsupervised_core.convex_hull_tracker.convex_hull_track import (
     ConvexHullTrackState,
 )
+from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
+    voxel_sampling_fast,
+)
 from lion.unsupervised_core.tracker.box_op import register_bbs
 
 from .box_utils import *
@@ -63,7 +67,6 @@ from .outline_utils import (
     OutlineFitter,
     TrackSmooth,
     points_rigid_transform,
-    voxel_sampling,
 )
 from .owlvit_frustum_tracker import OWLViTFrustumTracker
 from .trajectory_optimizer import (
@@ -73,6 +76,27 @@ from .trajectory_optimizer import (
 )
 
 PROFILING = True
+
+def iou_multipoint(hull1, hull2) -> float:
+    """
+    Compute IoU using cached geometric objects - much faster than original.
+
+    Args:
+        shape1, shape2: Alpha shape dictionaries with cached geometry
+
+    Returns:
+        IoU value between 0 and 1
+    """
+    # Handle degenerate cases (points, lines)
+    if hull1.area == 0 or hull2.area == 0:
+        return 0.0
+
+    # Compute intersection and union
+    intersection = hull1.intersection(hull2).area
+    union = hull1.union(hull2).area
+
+    # Return IoU
+    return intersection / union if union > 0 else 0.0
 
 def filter_frustum_points_clustering(
     points_3d: np.ndarray,
@@ -358,7 +382,7 @@ class OWLViTAlphaShapeMFCF:
 
         self.nms_iou_threshold = 0.7
         self.nms_query_distance = 5.0 # metres
-        self.nms_semantic_threshold = 0.7
+        self.nms_semantic_threshold = 0.9
 
         dataset_path = Path(
             "/home/uqdetche/lidar_longtail_mining/lion/data/argo2/sensor/"
@@ -630,7 +654,7 @@ class OWLViTAlphaShapeMFCF:
         all_H = np.concatenate(all_H)
         all_points = all_points[all_H > thresh]
         new_box_points = np.concatenate([all_points, cur_points])
-        new_box_points = voxel_sampling(new_box_points)
+        new_box_points = voxel_sampling_fast(new_box_points)
 
         return new_box_points, cur_points
 
@@ -928,7 +952,8 @@ class OWLViTAlphaShapeMFCF:
         camera_models: Dict[str, PinholeCamera],
         timestamp_city_SE3_ego_dict,
         tracker: ConvexHullKalmanTracker,
-        lidar_tree: cKDTree
+        lidar_tree: cKDTree,
+        search_radius:float =100.0
     ) -> List[Dict]:
         """
         Get vision-guided clusters by projecting LiDAR to cameras and filtering by OWLViT boxes.
@@ -963,6 +988,7 @@ class OWLViTAlphaShapeMFCF:
 
         lidar_cmp_indices = set()
         track_cmp_indices = set()
+        n_vertices_per_cmp = {}
 
         for cmp_lbl in range(lidar_n_components):
             mask = (lidar_connected_components_labels == cmp_lbl)
@@ -981,6 +1007,7 @@ class OWLViTAlphaShapeMFCF:
             # lidar_meshes.append(mesh)
             all_cmp_vertices.append(vertices)
             all_cmp_labels.append(np.full((len(vertices),), fill_value=cmp_lbl))
+            n_vertices_per_cmp[cmp_lbl] = len(vertices)
 
         # add confirmed tracklets
         track_ids = []
@@ -988,8 +1015,8 @@ class OWLViTAlphaShapeMFCF:
         track_label = lidar_n_components
         world_to_ego = np.linalg.inv(city_SE3_ego_lidar_t.transform_matrix)
         for track_idx, track in enumerate(tracker.tracks):
-            if not track.is_confirmed():
-                continue
+            # if not track.is_confirmed():
+            #     continue
 
             assert track_idx == track.track_id
 
@@ -1003,7 +1030,7 @@ class OWLViTAlphaShapeMFCF:
             all_cmp_labels.append(np.full((len(vertices),), fill_value=track_label))
 
             track_cmp_indices.add(track_label)
-
+            n_vertices_per_cmp[track_label] = len(vertices)
 
             track_label += 1
 
@@ -1045,11 +1072,14 @@ class OWLViTAlphaShapeMFCF:
             result_box_ids.append(np.arange(start=start, stop=start+n_boxes))
 
             start += n_boxes
-        # print("result_box_ids", result_box_ids)
 
         iou_matrix = np.zeros((total_boxes, n_components), dtype=np.float32)
+        objectness_matrix = np.zeros((total_boxes, 1), dtype=np.float32)
         dist_matrix = np.full((total_boxes, n_components), fill_value=1000, dtype=np.float32)
         box_infos = {i: {} for i in range(total_boxes)}
+
+        # cost of matching each lidar point to each box 
+        lidar_cost_matrix = np.full((len(points), total_boxes), fill_value=100, dtype=np.float32)
 
         for box_ids, result in tqdm(
             zip(result_box_ids, results),
@@ -1061,10 +1091,12 @@ class OWLViTAlphaShapeMFCF:
                 pred_boxes = result['pred_boxes']
                 image_class_embeds = result['image_class_embeds']
                 objectness_scores = result['objectness_scores']
-            assert len(pred_boxes) == len(image_class_embeds) == len(objectness_scores)
+            assert len(pred_boxes) == len(image_class_embeds) == len(objectness_scores) == len(box_ids)
 
             if len(pred_boxes) == 0:
                 continue
+
+            objectness_matrix[box_ids, 0] = objectness_scores
 
             camera_model = camera_models[camera_name]
             city_SE3_ego_cam_t = timestamp_city_SE3_ego_dict[cam_timestamp_ns]
@@ -1085,20 +1117,15 @@ class OWLViTAlphaShapeMFCF:
             if not np.any(is_valid_points):
                 continue
 
-            before_clamp = np.copy(uv_points[:, :2])
             uv_points[:, 0] = np.clip(uv_points[:, 0], 0, camera_model.width_px)
             uv_points[:, 1] = np.clip(uv_points[:, 1], 0, camera_model.height_px)
-
-            clamp_diff = np.abs(uv_points - before_clamp)
-            clamp_diff_mask = np.any(clamp_diff>=1, axis=1)
-
-            print(f"clamp_diff_mask {clamp_diff_mask.sum()} {(clamp_diff_mask.sum()/clamp_diff_mask.shape[0]):.2f}")
 
             valid_cmp_labels = all_cmp_labels[is_valid_points]
             valid_cmp_labels = np.unique(valid_cmp_labels)
 
             component_boxes = []
             component_centres = []
+            component_hulls = []
             for cmp_label in valid_cmp_labels:
                 mask = (all_cmp_labels == cmp_label) & is_valid_points
 
@@ -1117,17 +1144,60 @@ class OWLViTAlphaShapeMFCF:
                     np.concatenate([xy1, xy2], axis=0).astype(np.float32)
                 )
                 component_centres.append(xyc)
+                component_hulls.append(MultiPoint(component_uv_points).convex_hull)
 
             component_boxes = np.stack(component_boxes, axis=0)
             component_centres = np.stack(component_centres, axis=0)
 
             box_ious = box_iou(pred_boxes, component_boxes)
 
+            # ################################ project all lidar and compute costs
+            # (
+            #     lidar_uv_points,
+            #     _,
+            #     lidar_is_valid_points,
+            # ) = camera_model.project_ego_to_img_motion_compensated(
+            #     points,
+            #     city_SE3_ego_cam_t=city_SE3_ego_cam_t,
+            #     city_SE3_ego_lidar_t=city_SE3_ego_lidar_t,
+            # )
+
+            # lidar_indices = np.where(lidar_is_valid_points)[0]
+            # lidar_uv_points = lidar_uv_points[lidar_is_valid_points]
+
+            # for i, box_idx in enumerate(box_ids):
+            #     x1, y1, x2, y2 = pred_boxes[i]
+
+            #     mask = (lidar_uv_points[:, 0] >= x1) & (lidar_uv_points[:, 1] >= y1) & (lidar_uv_points[:, 0] <= x2) & (lidar_uv_points[:, 1] <= y2)
+
+            #     lidar_indices_box = lidar_indices[mask]
+
+
+
+            # ################################ project all lidar and compute costs
+
             for i, box_idx in enumerate(box_ids):
                 box_xyxy = pred_boxes[i]
                 box_xc = (box_xyxy[:2] + box_xyxy[2:]) / 2.0
+                x1, y1, x2, y2 = box_xyxy
+                # width = x2 - x1
+                # height = y2 - y1
+                # center = [(x1 + x2) / 2, (y1 + y2) / 2]
+
+                # Create as a 2D path
+                box_shape = Polygon.from_bounds(x1, y1, x2, y2)
+
+                mask_in_box = (uv_points[:, 0] >= x1) & (uv_points[:, 1] >= y1) & (uv_points[:, 0] <= x2) & (uv_points[:, 1] <= y2) 
+
                 for j, cmp_label in enumerate(valid_cmp_labels):
-                    iou_matrix[box_idx, cmp_label] = box_ious[i, j]
+                    mask = (all_cmp_labels == cmp_label) & is_valid_points & mask_in_box
+                    cmp_n_vertices = n_vertices_per_cmp[cmp_label]
+                    
+                    in_box_prop = mask.sum() / max(1, cmp_n_vertices)
+
+                    iou_box = box_ious[i, j]
+                    iou_mesh = iou_multipoint(box_shape, component_hulls[j])
+                    iou_matrix[box_idx, cmp_label] = (iou_box + iou_mesh + in_box_prop) / 3.0
 
                     dist = np.linalg.norm((box_xc - component_centres[j]))                    
                     dist_matrix[box_idx, cmp_label] = dist
@@ -1153,19 +1223,20 @@ class OWLViTAlphaShapeMFCF:
         # normalize by the dist
         dist_matrix_normalized = dist_matrix.copy() / dist_matrix.max(axis=1, keepdims=True)
 
-        cost_matrix = dist_matrix_normalized + (1.0 - iou_matrix)
+        cost_matrix = dist_matrix_normalized + (1.0 - iou_matrix) + (1.0 - objectness_matrix)
 
         # Greedy assignment
-        clusters_assigned = np.argmin(cost_matrix, axis=1)
+        # clusters_assigned = np.argmin(cost_matrix, axis=1)
+        box_assigned, cluster_assigned = linear_sum_assignment(cost_matrix)
 
-        matches_per_component = {i: (clusters_assigned == i).sum() for i in range(lidar_n_components)}
-        print(f"matches_per_component", [(k, v) for k, v in matches_per_component.items() if v > 0])
+        # matches_per_component = {i: (clusters_assigned == i).sum() for i in range(lidar_n_components)}
+        # print(f"matches_per_component", [(k, v) for k, v in matches_per_component.items() if v > 0])
 
-        matches_per_track = {i: (clusters_assigned == i).sum() for i in range(lidar_n_components, lidar_n_components + n_tracks)}
-        print(f"matches_per_track", [(k, v) for k, v in matches_per_track.items() if v > 0])
+        # matches_per_track = {i: (clusters_assigned == i).sum() for i in range(lidar_n_components, lidar_n_components + n_tracks)}
+        # print(f"matches_per_track", [(k, v) for k, v in matches_per_track.items() if v > 0])
 
-        ious_tracks = iou_matrix[:, lidar_n_components:].max(axis=0)
-        print("ious_tracks", ious_tracks)
+        # ious_tracks = iou_matrix[:, lidar_n_components:].max(axis=0)
+        # print("ious_tracks", ious_tracks)
         # for cmp_lbl, num_matched in matches_per_component.items():
         #     if num_matched == 0:
         #         continue
@@ -1179,7 +1250,8 @@ class OWLViTAlphaShapeMFCF:
         # keep track of which clusters have been assigned.
         clusters_assigned_set = set()
 
-        for box_idx, cmp_label in enumerate(clusters_assigned):
+        # for box_idx, cmp_label in enumerate(clusters_assigned):
+        for box_idx, cmp_label in zip(box_assigned, cluster_assigned):
             if iou_matrix[box_idx, cmp_label] < self.min_box_iou:
                 continue
 
@@ -1211,7 +1283,9 @@ class OWLViTAlphaShapeMFCF:
 
                 obj = ConvexHullObject(
                     original_points=world_points,
-                    confidence=box_info['objectness_score'],
+                    confidence=(box_info['objectness_score']+iou_matrix[box_idx, cmp_label])/2.0,
+                    iou_2d=iou_matrix[box_idx, cmp_label],
+                    objectness_score=box_info['objectness_score'],
                     feature=box_info['semantic_features'],
                     timestamp=timestamp_ns,
                     source="vision_guided"
@@ -1235,7 +1309,7 @@ class OWLViTAlphaShapeMFCF:
 
             needs_filtering = False
 
-            print(f"MATCH: Box {box_idx} <-> Component {cmp_label}: IoU: {iou_matrix[box_idx, cmp_label]:.2f} Distance: {dist_matrix[box_idx, cmp_label]:.2f}")
+            # print(f"MATCH: Box {box_idx} <-> Component {cmp_label}: IoU: {iou_matrix[box_idx, cmp_label]:.2f} Distance: {dist_matrix[box_idx, cmp_label]:.2f}")
             component_mask = (lidar_connected_components_labels == cmp_label)
             component_3d_points = points[component_mask].copy()
 
@@ -1247,7 +1321,9 @@ class OWLViTAlphaShapeMFCF:
 
             obj = ConvexHullObject(
                 original_points=component_3d_points_city,
-                confidence=box_info['objectness_score'],
+                confidence=(box_info['objectness_score']+iou_matrix[box_idx, cmp_label])/2.0,
+                iou_2d=iou_matrix[box_idx, cmp_label],
+                objectness_score=box_info['objectness_score'],
                 feature=box_info['semantic_features'],
                 timestamp=timestamp_ns,
                 source="vision_guided"
@@ -1284,15 +1360,14 @@ class OWLViTAlphaShapeMFCF:
 
             # TODO: potentially do filtering with boxes again.....
             in_box_prop = in_box_mask.sum() / max(1, len(in_box_mask))
-            print("in_box_prop", in_box_prop)
 
             clusters_assigned_set.add(cmp_label)
 
             num_w_box += 1
 
-            if in_box_prop > 0.5:
-                # don't add subsequent if mostly aligns?
-                continue
+            # if in_box_prop > self.nms_iou_threshold:
+            #     # don't add subsequent if mostly aligns?
+            #     continue
             
             component_3d_points_city = city_SE3_ego_lidar_t.transform_point_cloud(
                 component_3d_points
@@ -1300,7 +1375,9 @@ class OWLViTAlphaShapeMFCF:
 
             obj = ConvexHullObject(
                 original_points=component_3d_points_city,
-                confidence=box_info['objectness_score'],
+                confidence=(box_info['objectness_score']+iou_matrix[box_idx, cmp_label])/2.0,
+                iou_2d=iou_matrix[box_idx, cmp_label],
+                objectness_score=box_info['objectness_score'],
                 feature=box_info['semantic_features'],
                 timestamp=timestamp_ns,
                 source="vision_guided"
@@ -1308,6 +1385,13 @@ class OWLViTAlphaShapeMFCF:
 
             if obj.original_points is not None:
                 vision_clusters.append(obj)
+
+
+            # if obj.original_points is not None and in_box_prop < self.nms_iou_threshold:
+            #     vision_clusters.append(obj)
+            # elif full_obj.original_points is not None:
+            #     vision_clusters.append(full_obj)
+
         # find non assigned clusters
         non_assigned_clusters = set(cmp_lbl for cmp_lbl in range(lidar_n_components)).difference(clusters_assigned_set)
 
@@ -1324,36 +1408,23 @@ class OWLViTAlphaShapeMFCF:
         #     if len(component_3d_points) < self.min_component_points:
         #         continue
 
-        #     dims_mins = np.min(component_3d_points, axis=0)
-        #     dims_maxes = np.max(component_3d_points, axis=0)
-
-        #     lwh = dims_maxes - dims_mins
-
-        #     if (
-        #         np.any(lwh > 30.0)
-        #         or np.any(lwh < 0.05)
-        #     ):
-        #         continue            
-
-        #     alpha_shape = AlphaShapeUtils.compute_alpha_shape(component_3d_points)
-
-        #     if alpha_shape is None:
-        #         continue
-
-        #     centroid_3d = alpha_shape['centroid_3d']
-
-        #     # print(f"{cmp_label=} {centroid_3d=}")
-
-        #     num_no_box += 1
-        #     vision_clusters.append(
-        #         {
-        #             "source": "traditional",
-        #             "has_semantic_features": True,
-        #             "semantic_features": uniform_semantic_features,
-        #             "objectness_score": 0.0, 
-        #             **alpha_shape,
-        #         }
+        #     component_3d_points_city = city_SE3_ego_lidar_t.transform_point_cloud(
+        #         component_3d_points
         #     )
+
+        #     obj = ConvexHullObject(
+        #         original_points=component_3d_points_city,
+        #         confidence=0.0,
+        #         iou_2d=0.0,
+        #         objectness_score=0.0,
+        #         feature=uniform_semantic_features,
+        #         timestamp=timestamp_ns,
+        #         source="cluster"
+        #     )
+
+        #     if obj.original_points is not None:
+        #         num_no_box += 1
+        #         vision_clusters.append(obj)
             
 
         total = num_w_box + num_no_box
@@ -1586,7 +1657,7 @@ class OWLViTAlphaShapeMFCF:
         # These clusters come from purely geometric analysis of the LiDAR point cloud
         # They don't have semantic information but capture the full 3D structure
         for cluster in traditional_clusters:
-            new_points = voxel_sampling(cluster)
+            new_points = voxel_sampling_fast(cluster)
             alpha_shape = AlphaShapeUtils.compute_alpha_shape(new_points)
 
             if alpha_shape is not None:
@@ -1715,10 +1786,19 @@ class OWLViTAlphaShapeMFCF:
 
         tracker = ConvexHullKalmanTracker(debug=True)
 
-        for i in trange(min(20, len(infos)), desc=f"Generating hybrid alpha shapes"):
+        class_features = torch.load("/home/uqdetche/lidar_longtail_mining/lion/tools/class_features.pt")
+        # print(class_features)
+        class_features_names = list(class_features.keys())
+        class_features_array = np.stack([x.detach().numpy() for x in class_features.values()], axis=0)
+
+        class_features_array = class_features_array / np.linalg.norm(class_features_array, axis=1, keepdims=True)
+
+        print(f"{class_features_array.shape=}")
+
+        for i in trange(min(200, len(infos)), desc=f"Generating hybrid alpha shapes"):
             # 1. Load temporal LiDAR window
             aggregated_points = None
-            aggregated_points, cur_points = self._load_temporal_lidar_window(i, infos)
+            # aggregated_points, cur_points = self._load_temporal_lidar_window(i, infos)
 
             pose = infos[i]['pose']
 
@@ -1727,6 +1807,7 @@ class OWLViTAlphaShapeMFCF:
                 "timestamp_ns", None
             )  # Fallback if no timestamp
             assert timestamp_ns is not None, infos[i].keys()
+            all_timestamps.append(timestamp_ns)
 
             # 3. Generate both cluster types
             # traditional_clusters = self._get_traditional_clusters(aggregated_points)
@@ -1815,12 +1896,9 @@ class OWLViTAlphaShapeMFCF:
 
             fig, ax = plt.subplots(figsize=(8,8))
 
-            lidar_points = np.load(lidar_path)[:, 0:3]
-            lidar_points = points_rigid_transform(lidar_points, pose)
-
             ax.scatter(
-                lidar_points[:, 0],
-                lidar_points[:, 1],
+                pcl_city_1[:, 0],
+                pcl_city_1[:, 1],
                 s=1,
                 c="blue",
                 label="Lidar Points",
@@ -1848,7 +1926,7 @@ class OWLViTAlphaShapeMFCF:
                     linewidth=1,
                     edgecolor=color,
                     facecolor="none",
-                    alpha=0.5,
+                    alpha=1.0,
                     linestyle="-",
                 )
                 ax.add_patch(obj_polygon)
@@ -1864,8 +1942,6 @@ class OWLViTAlphaShapeMFCF:
                 # Get rotated box corners
                 corners = get_rotated_box(center_xy, length, width, yaw)
 
-                corners3d = get_rotated_3d_box_corners(box)
-
                 color = "yellow"
                 alpha = 0.3
                 if track.is_confirmed():
@@ -1876,13 +1952,122 @@ class OWLViTAlphaShapeMFCF:
 
                 track_polygon = patches.Polygon(
                     corners,
-                    linewidth=3,
+                    linewidth=2,
                     edgecolor=color,
                     facecolor="none",
                     alpha=alpha,
                     linestyle="-",
                 )
                 ax.add_patch(track_polygon)
+
+                if track.optimized_boxes is not None:
+                    box = track.optimized_boxes[-1]
+
+
+                    for box in track.optimized_boxes:
+                        center_xy = box[:2]
+                        length = box[3]
+                        width = box[4]
+                        yaw = box[6]
+
+                        # Get rotated box corners
+                        corners = get_rotated_box(center_xy, length, width, yaw)
+                        track_polygon = patches.Polygon(
+                            corners,
+                            linewidth=1,
+                            edgecolor=color,
+                            facecolor="none",
+                            alpha=1.0,
+                            linestyle="--",
+                        )
+                        ax.add_patch(track_polygon)
+
+                if track.is_confirmed():
+                    # next_timestamp_ns = timestamp_ns + 1e+8
+                    
+                    boxes = track.extrapolate_box(all_timestamps)
+                    for box in boxes:
+                        center_xy = box[:2]
+                        length = box[3]
+                        width = box[4]
+                        yaw = box[6]
+
+                        # Get rotated box corners
+                        corners = get_rotated_box(center_xy, length, width, yaw)
+                        track_polygon = patches.Polygon(
+                            corners,
+                            linewidth=1,
+                            edgecolor="orange",
+                            facecolor="none",
+                            alpha=1.0,
+                            linestyle="--",
+                        )
+                        ax.add_patch(track_polygon)
+
+
+                # if track.is_confirmed():
+                #     next_timestamp_ns = timestamp_ns + 1e+8
+                #     box = track.extrapolate_kalman_box(next_timestamp_ns)
+                #     center_xy = box[:2]
+                #     length = box[3]
+                #     width = box[4]
+                #     yaw = box[6]
+
+                #     # Get rotated box corners
+                #     corners = get_rotated_box(center_xy, length, width, yaw)
+                #     track_polygon = patches.Polygon(
+                #         corners,
+                #         linewidth=1,
+                #         edgecolor="purple",
+                #         facecolor="none",
+                #         alpha=1.0,
+                #         linestyle="--",
+                #     )
+                #     ax.add_patch(track_polygon)
+
+
+
+                # center_xy = track.to_box()[:2]
+                # xc, yc = center_xy[0], center_xy[1]
+                # dist = np.linalg.norm(center_xy[:2]-ego_pos[:2])
+                # if track.last_avg_velocity is not None and dist < 50:
+                #     vel_2d = track.last_avg_velocity[:2]
+                #     last_yaw = track.last_yaw
+                #     box_yaw = track.to_box()[6]
+
+                #     ax.text(xc ,yc, f"{vel_2d[0]:.2f} {vel_2d[1]:.2f} {last_yaw:.2f} {box_yaw:.2f}", fontsize=12)
+
+
+                # center_xy = track.to_box()[:2]
+                # xc, yc = center_xy[0], center_xy[1]
+                # dist = np.linalg.norm(center_xy[:2]-ego_pos[:2])
+                # if dist < 50 and track.is_confirmed():
+                #     track_features = track.features[-1]
+                #     dots = class_features_array @ track_features
+                #     print(f"dots {dots.shape} {dots.min()} {dots.max()}")
+                #     best_cls_idx = np.argmax(dots)
+                #     class_name = class_features_names[best_cls_idx]
+                #     ax.text(xc ,yc, f"{class_name} {dots[best_cls_idx]:.3f}", fontsize=12)
+                #     # ax.text(xc ,yc, f"id:{track.track_id} age:{track.age} hits:{track.hits} iou:{track.last_iou}", fontsize=12)
+
+
+                # if track.last_mesh is not None and track.is_confirmed():
+                if track.last_mesh is not None and track.is_confirmed():
+                    vertices_3d = track.last_mesh.vertices
+                    vertices_2d = vertices_3d[:, :2]
+
+                    hull = ConvexHull(vertices_2d)
+                    vertices_2d = vertices_2d[hull.vertices]
+
+                    # Create polygon patch for alpha shape
+                    polygon = patches.Polygon(
+                        vertices_2d,
+                        linewidth=1,
+                        edgecolor=color,
+                        facecolor="none",
+                        alpha=1.0,
+                    )
+                    ax.add_patch(polygon)                    
 
                 positions = np.stack(track.positions, axis=0)
                 ax.plot(positions[:, 0], positions[:, 1], alpha=alpha, linewidth=1, color=color)
@@ -1904,6 +2089,181 @@ class OWLViTAlphaShapeMFCF:
             save_path = save_folder / f"frame_{i}.png"
             plt.savefig(save_path, dpi=300, bbox_inches="tight")
             plt.close()
+
+            image = np.zeros((2000, 2000, 3), dtype=np.uint8)
+            new_image = image.copy()
+            text_size = int(image.shape[1] / 1000)
+            text_pixel = int(image.shape[1]/400)
+            max_shape = max(image.shape)
+            previous_label_boxes = []
+            text_infos = []
+
+            color_map = {
+                "yellow": (0, 255, 255),
+                "green": (0, 255, 0), 
+                "red": (0, 0, 255)
+            }
+
+            # Define world coordinate bounds (-50 to +50 meters relative to ego)
+            world_x_min, world_x_max = ego_pos[0] - 50, ego_pos[0] + 50
+            world_y_min, world_y_max = ego_pos[1] - 50, ego_pos[1] + 50
+
+            print("world_x_range", (world_x_min, world_x_max))
+            print("world_y_range", (world_y_min, world_y_max))
+
+            def to_image_coords(points):
+                """Convert world coordinates to image pixel coordinates"""
+                # Handle both single point [x, y] and multiple points [[x1, y1], [x2, y2], ...]
+                points = np.array(points)
+                if points.ndim == 1:
+                    points = points.reshape(1, -1)
+                
+                # Extract x, y coordinates
+                x_world = points[:, 0]
+                y_world = points[:, 1]
+                
+                # Normalize to [0, 1] range
+                x_norm = (x_world - world_x_min) / (world_x_max - world_x_min)
+                y_norm = (y_world - world_y_min) / (world_y_max - world_y_min)
+                
+                # Convert to pixel coordinates
+                # Note: cv2 coordinate system has (0,0) at top-left
+                # x increases rightward (same as world)
+                # y increases downward (opposite of typical world coordinates)
+                x_pixel = x_norm * 2000
+                y_pixel = (1 - y_norm) * 2000  # Flip y-axis for cv2
+                
+                # Convert to integers and clip to image bounds
+                x_pixel = np.clip(x_pixel, 0, 1999).astype(np.int32)
+                y_pixel = np.clip(y_pixel, 0, 1999).astype(np.int32)
+                
+                # Return as integer coordinates
+                coords = np.column_stack([x_pixel, y_pixel])
+                
+                # If input was single point, return single point
+                if coords.shape[0] == 1:
+                    return tuple(coords[0])
+                else:
+                    return coords
+
+
+
+            for track in tracks:
+                box = track.to_box()
+                center_xy = box[:2]
+                length = box[3]
+                width = box[4]
+                yaw = box[6]
+
+                # Get rotated box corners
+                corners = get_rotated_box(center_xy, length, width, yaw)
+                
+                color_name = "yellow"
+                alpha = 0.3
+                if track.is_confirmed():
+                    color_name = "green"
+                    alpha = 0.7
+                elif track.is_deleted():
+                    color_name = "red"
+
+                color_bgr = color_map[color_name]
+                
+                # Convert corners to integer pixel coordinates
+                corners = to_image_coords(corners)
+                corners_int = np.array(corners, dtype=np.int32)
+
+                dist = np.linalg.norm(center_xy[:2]-ego_pos[:2])
+                # print(f"x, y = {x}, {y}")
+                
+                if dist >= 50:
+                    continue
+
+
+                x, y = to_image_coords(center_xy)
+
+                # Create overlay for alpha blending
+                overlay = image.copy()
+                
+                # Draw solid polygon outline
+                cv2.polylines(overlay, [corners_int], isClosed=True, color=color_bgr, thickness=2)
+                
+                # Blend with original image for alpha effect
+                cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+
+                continue
+
+                s= f"id:{track.track_id} age:{track.age} hits:{track.hits} iou:{track.last_iou}"
+
+                (label_width, label_height), baseline = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, text_size, text_pixel)
+                original_top_left = (int(x), int(y) - label_height - baseline*2)
+                top_left = original_top_left
+
+                # clip the top left so that the label is not off the image
+                top_left = (np.clip(top_left[0], 0, max_shape - label_width), np.clip(top_left[1], 0, max_shape - label_height - baseline))
+
+                # base the bottom right on the new top_left
+                bottom_right = (top_left[0] + label_width, top_left[1] + label_height + baseline*2)
+                curr_box = np.array([top_left[0], top_left[1], bottom_right[0], bottom_right[1]])
+
+                # check if the current label overlaps with another, then move it by it's height
+                for prev_box in previous_label_boxes:
+                    if box_iou(curr_box[None, :], prev_box[None, :]) > 0.1:
+                        curr_box[[1, 3]] += label_height + baseline * 2
+
+                previous_label_boxes.append(curr_box)
+                top_left, bottom_right = curr_box[0:2], curr_box[2:]
+
+                # Draw arrow if text was moved significantly from original position
+                original_center = (int(x), int(y))
+                final_text_center = (int(top_left[0] + label_width // 2), int(top_left[1] + label_height // 2))
+                distance_moved = np.sqrt((final_text_center[0] - original_center[0])**2 + 
+                                        (final_text_center[1] - original_center[1])**2)
+
+                # Draw arrow if moved more than threshold (e.g., 10 pixels)
+                if distance_moved > 10:
+                    # Draw arrow from final text position to original position
+                    arrow_color = (128, 128, 128)  # Gray color for arrow
+                    arrow_thickness = 1
+                    
+                    # Calculate arrow start point (edge of text box closest to original position)
+                    dx = original_center[0] - final_text_center[0]
+                    dy = original_center[1] - final_text_center[1]
+                    
+                    # Normalize direction and scale to text box edge
+                    if abs(dx) > abs(dy):
+                        # Arrow starts from left/right edge of text
+                        arrow_start_x = int(top_left[0] if dx > 0 else bottom_right[0])
+                        arrow_start_y = final_text_center[1]
+                    else:
+                        # Arrow starts from top/bottom edge of text
+                        arrow_start_x = final_text_center[0]
+                        arrow_start_y = int(top_left[1] if dy > 0 else bottom_right[1])
+                    
+                    arrow_start = (arrow_start_x, arrow_start_y)
+                    
+                    # Draw the arrow line
+                    cv2.arrowedLine(image, arrow_start, original_center, 
+                                    arrow_color, arrow_thickness, tipLength=0.3)
+
+                # Draw the label background rectangle
+                new_image = cv2.rectangle(
+                    new_image, tuple(int(x) for x in top_left), tuple(int(x) for x in bottom_right), color_bgr, -1)
+
+                # Add text info for later rendering
+                text_infos.append([s, (int(top_left[0]), int(top_left[1]) + baseline + label_height), 
+                                cv2.FONT_HERSHEY_SIMPLEX, text_size, color_bgr, text_pixel, cv2.LINE_AA])
+
+            image = cv2.addWeighted(new_image, alpha, image, 1 - alpha, 0)
+
+            for text_info in text_infos:
+                print("text_info", text_info)
+                cv2.putText(
+                    image, *text_info
+                )
+
+            cv2.imwrite(str(save_folder / f"frame_{i}_cv.png"), image)
+
+
             #################################################################
 
             
@@ -1985,10 +2345,15 @@ class OWLViTAlphaShapeMFCF:
 
                 mesh = trimesh.convex.convex_hull(ego_points)
 
+                track_box = track.to_box()
+                print("optimized box", box)
+                print("track_box", track_box)
+                box = track_box
+
                 # box = apply_pose_to_box(world_to_ego, box)
-                # print("world box", box)
-                # box = register_bbs(box.reshape(1, 7), world_to_ego)[0]
-                # print("ego box", box)
+                print("world box", box)
+                box = register_bbs(box.reshape(1, 7), world_to_ego)[0]
+                print("ego box", box)
 
                 infos[frame_id]["outline_box"].append(box)
                 infos[frame_id]["outline_ids"].append(track.track_id)
@@ -2336,7 +2701,7 @@ class AlphaShapeMFCF:
             all_H = np.concatenate(all_H)
             all_points = all_points[all_H > thresh]
             new_box_points = np.concatenate([all_points, cur_points])
-            new_box_points = voxel_sampling(new_box_points)
+            new_box_points = voxel_sampling_fast(new_box_points)
 
             # Remove ground and cluster (same as original)
             non_ground_points = self.outline_estimator.remove_ground(new_box_points)

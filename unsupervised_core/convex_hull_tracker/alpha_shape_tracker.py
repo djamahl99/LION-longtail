@@ -1,69 +1,63 @@
 import cProfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import io
 import os
-from pathlib import Path
 import pickle as pkl
+import pstats
 import time
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from pprint import pprint
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import av2.geometry.polyline_utils as polyline_utils
+import av2.rendering.vector as vector_plotting_utils
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
-from tqdm import tqdm, trange
-from scipy.spatial import ConvexHull, cKDTree
-from shapely.geometry import Polygon, MultiPoint
-from shapely.ops import unary_union
-from collections import defaultdict
-from scipy.spatial.distance import cdist
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from typing import Dict, List, Tuple, Optional, Any, Union
-from scipy.optimize import linear_sum_assignment
-from kornia.geometry.linalg import transform_points
-from pprint import pprint
-import trimesh
 import PIL.Image as Image
-import io
-import pstats
-
-
-from av2.map.map_api import ArgoverseStaticMap, GroundHeightLayer
-
-from av2.map.lane_segment import LaneSegment
-import av2.rendering.vector as vector_plotting_utils
-import av2.geometry.polyline_utils as polyline_utils
+import torch
+import trimesh
 from av2.datasets.sensor.constants import RingCameras, StereoCameras
 from av2.datasets.sensor.sensor_dataloader import (
     SensorDataloader,
     SynchronizedSensorData,
 )
+from av2.geometry.camera.pinhole_camera import PinholeCamera
+from av2.map.lane_segment import LaneSegment
+from av2.map.map_api import ArgoverseStaticMap, GroundHeightLayer
 from av2.rendering.color import ColorFormats, create_range_map
 from av2.rendering.rasterize import draw_points_xy_in_img
 from av2.structures.sweep import Sweep
-from av2.utils.io import read_city_SE3_ego
-from av2.utils.io import read_ego_SE3_sensor, read_feather
-from av2.map.map_api import ArgoverseStaticMap
 from av2.structures.timestamped_image import TimestampedImage
-from av2.geometry.camera.pinhole_camera import PinholeCamera
+from av2.utils.io import read_city_SE3_ego, read_ego_SE3_sensor, read_feather
+from kornia.geometry.linalg import transform_points
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial import ConvexHull, cKDTree
+from scipy.spatial.distance import cdist
+from shapely.geometry import MultiPoint, Polygon
+from shapely.ops import unary_union
+from sklearn.cluster import DBSCAN
+from tqdm import tqdm, trange
 
+from lion.unsupervised_core.box_utils import *
 from lion.unsupervised_core.convex_hull_tracker.alpha_shape_utils import AlphaShapeUtils
-
-
+from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
+    voxel_sampling_fast,
+)
+from lion.unsupervised_core.file_utils import load_predictions_parallel
 from lion.unsupervised_core.outline_utils import (
     OutlineFitter,
     TrackSmooth,
-    voxel_sampling,
     points_rigid_transform,
 )
+from lion.unsupervised_core.owlvit_frustum_tracker import OWLViTFrustumTracker
 from lion.unsupervised_core.trajectory_optimizer import (
     GlobalTrajectoryOptimizer,
     optimize_with_gtsam_timed,
     simple_pairwise_icp_refinement,
 )
-
-from lion.unsupervised_core.box_utils import *
-from lion.unsupervised_core.file_utils import load_predictions_parallel
-from lion.unsupervised_core.owlvit_frustum_tracker import OWLViTFrustumTracker
-from sklearn.cluster import DBSCAN
-
 
 
 class AlphaShapeTracker:
@@ -937,7 +931,7 @@ class AlphaShapeTracker:
 
             merged_object_points = best_points
 
-            merged_object_points = voxel_sampling(merged_object_points, 0.05, 0.05, 0.05)
+            merged_object_points = voxel_sampling_fast(merged_object_points, 0.05, 0.05, 0.05)
 
             # ppscore = compute_ppscore(merged_object_points, object_points)
             # print("merged_object_points ppscore", ppscore.min(), ppscore.mean(), ppscore.max())

@@ -51,6 +51,7 @@ from lion.unsupervised_core.convex_hull_tracker.convex_hull_track import (
 from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
     relative_object_pose,
     rigid_icp,
+    voxel_sampling_fast,
 )
 from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import (
     PoseKalmanFilter,
@@ -59,7 +60,6 @@ from lion.unsupervised_core.file_utils import load_predictions_parallel
 from lion.unsupervised_core.outline_utils import (
     OutlineFitter,
     points_rigid_transform,
-    voxel_sampling,
 )
 from lion.unsupervised_core.tracker.box_op import register_bbs
 from lion.unsupervised_core.trajectory_optimizer import (
@@ -102,9 +102,9 @@ class ConvexHullKalmanTracker:
         self.icp_max_dist = 1.0
         self.icp_max_iterations = 10
 
-        self.nms_iou_threshold = 0.5
-        self.nms_semantic_threshold: float = 0.7
-        self.nms_query_distance: float = 1.0
+        self.nms_iou_threshold = 0.3
+        self.nms_semantic_threshold: float = 0.9
+        self.nms_query_distance: float = 15.0
         self.n_points_err_thresh = 0.3
 
         self.min_component_points = 10
@@ -113,6 +113,7 @@ class ConvexHullKalmanTracker:
         self.max_age = 10  # 10 frames -> 1 second
 
         self.updates_per_track = {}
+        self.timestamps = []
 
         # Debug statistics
         if self.debug:
@@ -129,7 +130,10 @@ class ConvexHullKalmanTracker:
         This function should be called once every time step, before `update`.
         """
         for track in self.tracks:
-            track.predict(self.kf, timestamp)
+            if not track.is_deleted():
+                track.predict(self.kf, timestamp)
+
+        self.timestamps.append(timestamp)
 
     def update(
         self,
@@ -140,6 +144,9 @@ class ConvexHullKalmanTracker:
         # Run matching cascade.
         # matches, unmatched_tracks, unmatched_detections = \
         #     self._match(convex_hulls, pose)
+
+        # TODO: get boxes in here and do projection etc, rather than _get_vision_clusters...
+        # -> more efficienct? can match with tracks first then remaining boxes can be added?
 
         matches, unmatched_tracks, unmatched_detections = self._match_full(
             convex_hulls, pose
@@ -163,64 +170,68 @@ class ConvexHullKalmanTracker:
         unmatched_and_missed = set()
         unmatched_and_found = set()
 
-        unmatched_ious = []
-        for track_idx in unmatched_tracks:
-            track = self.tracks[track_idx]
-
-            if track.is_deleted():
-                continue
-
-            pos = track.mean[:3]
-            radius = np.linalg.norm(track.lwh*0.5)
-
-            lidar_indices = lidar_tree.query_ball_point(pos, radius)
-            lidar_indices = np.array(lidar_indices, int)
-
-            iou = 0.0
-            if len(lidar_indices) > self.min_component_points:
-                # track_mesh = track.to_shape_dict()['mesh']
-                # points = lidar_tree.data[lidar_indices]
-                # mesh_points = voxel_sampling(points)
-                # cur_mesh = trimesh.convex.convex_hull(mesh_points)
-
-                # iou = self._convex_hull_iou_trimesh(cur_mesh, track_mesh)
-
-                track_box = track.to_box()
-                points = lidar_tree.data[lidar_indices]
-
-                # get points in the bbox
-                n_orig_points = len(points)
-                points = ConvexHullObject.points_in_box(track_box, points.copy())
-                n_in_box = len(points)
-
-                if n_in_box < self.min_component_points:
-                    continue
-
-                # print(f"points in box {n_in_box} ({(n_in_box/n_orig_points)})")
-                
-                cur_box = ConvexHullObject.points_to_bounding_box(points, track.mean[:3])
-
-                iou = self._box_iou_3d(cur_box, track_box)
-
-            unmatched_ious.append(iou)
-
-            # if err > self.n_points_err_thresh:
-            if iou < self.min_iou_threshold:
-                self.tracks[track_idx].mark_missed()
-                unmatched_and_missed.add(track_idx)
-            else:
-                # self.tracks[track_idx].mark_hit()
-                points = lidar_tree.data[lidar_indices]
-                self.tracks[track_idx].update_raw_lidar(self.kf, points)
-                unmatched_and_found.add(track_idx)
-
+        # unmatched_ious = []
         # for track_idx in unmatched_tracks:
-        #     # self.tracks[track_idx].mark_missed()
-        #     unmatched_and_missed.add(track_idx)
+        #     track = self.tracks[track_idx]
 
-        if len(unmatched_ious) > 0:
-            unmatched_ious = np.array(unmatched_ious)
-            print(f"unmatched_ious {unmatched_ious.min()} {unmatched_ious.mean()} {unmatched_ious.max()}")
+        #     if track.is_deleted():
+        #         continue
+
+        #     pos = track.mean[:3]
+        #     radius = np.linalg.norm(track.lwh * 0.5)
+
+        #     lidar_indices = lidar_tree.query_ball_point(pos, radius)
+        #     lidar_indices = np.array(lidar_indices, int)
+
+        #     iou = 0.0
+        #     if len(lidar_indices) > self.min_component_points:
+        #         # track_mesh = track.to_shape_dict()['mesh']
+        #         # points = lidar_tree.data[lidar_indices]
+        #         # mesh_points = voxel_sampling(points)
+        #         # cur_mesh = trimesh.convex.convex_hull(mesh_points)
+
+        #         # iou = self._convex_hull_iou_trimesh(cur_mesh, track_mesh)
+
+        #         track_box = track.to_box()
+        #         points = lidar_tree.data[lidar_indices]
+
+        #         # get points in the bbox
+        #         n_orig_points = len(points)
+        #         points = ConvexHullObject.points_in_box(track_box, points.copy())
+        #         n_in_box = len(points)
+
+        #         if n_in_box < self.min_component_points:
+        #             continue
+
+        #         # print(f"points in box {n_in_box} ({(n_in_box/n_orig_points)})")
+
+        #         cur_box = ConvexHullObject.points_to_bounding_box(
+        #             points, track_box[:3]
+        #         )
+
+        #         iou = self._box_iou_3d(cur_box, track_box)
+
+        #         # cur_mesh = trimesh.convex.convex_hull(points)
+
+        #         # iou = self._convex_hull_iou_trimesh(
+        #         #     track.history[-1].mesh, cur_mesh
+        #         # )
+
+        #     unmatched_ious.append(iou)
+
+        #     # if err > self.n_points_err_thresh:
+        #     if iou < self.min_iou_threshold:
+        #         self.tracks[track_idx].mark_missed()
+        #         unmatched_and_missed.add(track_idx)
+        #     else:
+        #         # self.tracks[track_idx].mark_hit()
+        #         points = lidar_tree.data[lidar_indices]
+        #         self.tracks[track_idx].update_raw_lidar(self.kf, points)
+        #         unmatched_and_found.add(track_idx)
+
+        for track_idx in unmatched_tracks:
+            # self.tracks[track_idx].mark_missed()
+            unmatched_and_missed.add(track_idx)
 
         # tracks_tree = cKDTree([x.to_box()[:3] for x in self.tracks if not x.is_deleted()])
         for detection_idx in unmatched_detections:
@@ -229,7 +240,16 @@ class ConvexHullKalmanTracker:
             convex_hull_feature = convex_hulls[detection_idx].feature
             found_match = False
             for track in self.tracks:
-                iou = self._box_iou_3d(convex_hull_box, track.to_box())
+                if track.is_deleted():
+                    continue
+                iou1 = self._box_iou_3d(convex_hull_box, track.to_box()) 
+                # iou2 = self._box_iou_3d(convex_hull_box, track.history[-1].box)
+                # iou = max(iou1, iou2) 
+
+                iou = iou1
+
+                # mean_track_features = np.stack(track.features, axis=0).mean(axis=0)
+                # mean_track_features = mean_track_features / (1e-6 + np.linalg.norm(mean_track_features))
                 semantic_overlap = np.dot(convex_hull_feature, track.features[-1])
                 if (
                     iou > self.nms_iou_threshold
@@ -241,29 +261,221 @@ class ConvexHullKalmanTracker:
             if not found_match:
                 self._initiate_track(convex_hulls[detection_idx])
 
+        new_merged_tracks = 0
+        # new_merged_tracks = self.merge_tracks()
+
         suppressed_tracks = self.track_nms()
-        
+
         print(f"Tracks updated: matches: {len(matched_tracks)}")
         print(
             f"            unmatched_and_found: {len(unmatched_and_found)} unmatched_and_missed: {(len(unmatched_and_missed))}"
         )
         print(f"            suppressed_tracks: {len(suppressed_tracks)}")
+        print(f"            new_merged_tracks: {new_merged_tracks}")
 
-        # self.tracks = [t for t in self.tracks if not t.is_deleted()]
 
-        # # Update distance metric.
-        # active_targets = [t.track_id for t in self.tracks if t.is_confirmed()]
-        # features, targets = [], []
-        # for track in self.tracks:
-        #     if not track.is_confirmed():
-        #         continue
-        #     features += track.features
-        #     targets += [track.track_id for _ in track.features]
-        #     track.features = []
-        # self.metric.partial_fit(
-        #     np.asarray(features), np.asarray(targets), active_targets)
+    def merge_tracks(self):
 
-        # # # self.frame_tracks[timestamp_ns] = frame_assignments
+        # can we find any previous timestamps where a track did not exist, then see if we can extrapolate and find if another track could merge?
+        # all_timestamps = set(self.timestamps)
+        timestamps = sorted(list(set(self.timestamps)))
+        # track_indices = [i for i, track in enumerate(self.tracks) if track.is_confirmed()]
+
+        new_merged_tracks = 0
+
+        def get_priority_score(idx: int):
+            track: ConvexHullTrack = self.tracks[idx]
+            avg_confidence = np.mean([x.confidence for x in track.history])
+
+            status_priority = 2
+            if track.is_tentative():
+                status_priority = 1
+            elif track.is_deleted():
+                status_priority = 0
+
+            return (status_priority, track.hits, avg_confidence)
+
+        track_indices = sorted(
+            list(range(len(self.tracks))),
+            key=get_priority_score,
+            reverse=True,
+        )
+
+        if len(track_indices) > 0:
+            track_features = np.stack([self.tracks[x].features[-1] for x in track_indices], axis=0)
+            semantic_overlaps = track_features @ track_features.T
+            tracks_boxes = np.stack([self.tracks[idx].extrapolate_box(timestamps) for idx in track_indices], axis=0)
+            tracks_positions = tracks_boxes[..., :3]
+            print("tracks_positions", tracks_positions.shape)
+
+            for i, track_idx1 in enumerate(track_indices):
+                track1 = self.tracks[track_idx1]
+                track1_timestamps = track1.timestamps
+
+                if track1.is_deleted():
+                    break
+
+                for j in range(i + 1, len(track_indices)):
+                    track_idx2 = track_indices[j]
+                    dists = np.linalg.norm(tracks_positions[i]-tracks_positions[j], axis=1)
+                    mean_dist = dists.mean()
+
+                    # these could potentially be the same object...
+                    closest_idx = np.argmin(dists)
+                    min_dist = dists[closest_idx]
+
+                    box1 = tracks_boxes[i, closest_idx]
+                    box2 = tracks_boxes[j, closest_idx]
+
+                    iou = self._box_iou_3d(box1, box2)
+
+                    track2 = self.tracks[track_idx2]
+
+                    track2_timestamps = track2.timestamps
+
+                    times1_set = set(track1_timestamps)
+                    times2_set = set(track2_timestamps)
+
+                    times_difference = times1_set.symmetric_difference(times2_set)
+
+                    combined_timestamps = sorted(list(times1_set.union(times2_set)))
+
+                    if min_dist < self.nms_query_distance and semantic_overlaps[i, j] > self.nms_semantic_threshold and iou > self.nms_iou_threshold and len(times_difference) > 0:
+                        print("dists", dists.shape, dists.min(), dists.max())
+                        print("min_dist", min_dist)
+                        print("mean_dist", mean_dist)
+                        print("times1, times2, times_difference", len(times1_set), len(times2_set), len(times_difference))
+                        print(f"{iou=:.3f}")
+
+
+                        times1 = np.array(self.tracks[track_idx1].timestamps, int)
+                        times2 = np.array(self.tracks[track_idx2].timestamps, int)
+
+
+                        combined_idx = None
+                        for timestamp in combined_timestamps:
+                            track1_indices = np.where(times1==timestamp)[0]
+                            track2_indices = np.where(times2==timestamp)[0]
+
+                            convex_hull_obj = None
+                            if len(track1_indices) == 0 and len(track2_indices) == 1:
+                                idx = track2_indices[0]
+                                convex_hull_obj = track2.history[idx]
+                            elif len(track1_indices) == 1 and len(track2_indices) == 0:
+                                idx = track1_indices[0]
+                                convex_hull_obj = track1.history[idx]
+                            elif len(track1_indices) == 1 and len(track2_indices) == 1:
+                                # merge...
+                                idx1 = track1_indices[0]
+                                convex_hull_obj1 = track1.history[idx1]
+
+                                idx2 = track2_indices[0]
+                                convex_hull_obj2 = track2.history[idx2]
+
+                                points1 = convex_hull_obj1.original_points
+                                points2 = convex_hull_obj2.original_points
+
+                                # need to calculate the pose difference between...
+
+                                print(f"{points1.shape=} {points2.shape=}")
+                                points = np.concatenate([points1, points2], axis=0)
+
+                                print(f"merged {points.shape}")
+
+
+                                convex_hull_obj = ConvexHullObject(
+                                    points,
+                                    convex_hull_obj1.confidence,
+                                    convex_hull_obj1.iou_2d,
+                                    convex_hull_obj1.objectness_score,
+                                    convex_hull_obj1.feature,
+                                    timestamp,
+                                    convex_hull_obj1.source
+                                )
+
+                                if convex_hull_obj.original_points is None:
+                                    fig, ax = plt.subplots(figsize=(8,8))
+
+                                    ax.scatter(
+                                        points1[:, 0],
+                                        points1[:, 1],
+                                        s=3,
+                                        c="blue",
+                                        label="points1",
+                                        alpha=0.5,
+                                    )
+                                
+                                    ax.scatter(
+                                        points2[:, 0],
+                                        points2[:, 1],
+                                        s=3,
+                                        c="green",
+                                        label="points2",
+                                        alpha=0.5,
+                                    )
+                                    
+                                    for box in [convex_hull_obj1.box, convex_hull_obj2.box]:
+                                        center_xy = box[:2]
+                                        length = box[3]
+                                        width = box[4]
+                                        yaw = box[6]
+
+                                        # Get rotated box corners
+                                        corners = get_rotated_box(center_xy, length, width, yaw)
+                                        track_polygon = patches.Polygon(
+                                            corners,
+                                            linewidth=1,
+                                            edgecolor="blue",
+                                            facecolor="none",
+                                            alpha=1.0,
+                                            linestyle="--",
+                                        )
+                                        ax.add_patch(track_polygon)
+
+                                    for box in [box1, box2]:
+                                        center_xy = box[:2]
+                                        length = box[3]
+                                        width = box[4]
+                                        yaw = box[6]
+
+                                        # Get rotated box corners
+                                        corners = get_rotated_box(center_xy, length, width, yaw)
+                                        track_polygon = patches.Polygon(
+                                            corners,
+                                            linewidth=1,
+                                            edgecolor="orange",
+                                            facecolor="none",
+                                            alpha=1.0,
+                                            linestyle="--",
+                                        )
+                                        ax.add_patch(track_polygon)
+
+                                    ax.set_aspect("equal")
+                                    ax.grid(True, alpha=0.3)
+                                    ax.set_xlabel("X (meters)", fontsize=12)
+                                    ax.set_ylabel("Y (meters)", fontsize=12)
+
+                                    plt.tight_layout()
+
+                                    save_path = "failed_merge.png"
+                                    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+                                    plt.close()
+                                    exit()
+                            else:
+                                raise ValueError(f"{len(track1_indices)=} {len(track2_indices)=}")
+
+                            if convex_hull_obj.original_points is None:
+                                continue # something wrong... e.g. too large
+
+                            if combined_idx is None:
+                                self._initiate_track(convex_hull_obj)
+                                combined_idx = len(self.tracks) - 1
+                            else:
+                                self.tracks[combined_idx].update(self.kf, convex_hull_obj)
+
+
+                        new_merged_tracks += 1
+        return new_merged_tracks
 
     def track_nms(self) -> set:
         def get_priority_score(track: ConvexHullTrack):
@@ -278,15 +490,10 @@ class ConvexHullKalmanTracker:
 
         sorted_boxes = np.stack([x.to_box() for x in sorted_tracks], axis=0)
         sorted_positions = sorted_boxes[:, :3]
-        sorted_features = np.stack(
-            [np.mean(np.stack(x.features, axis=0), axis=0) for x in sorted_tracks],
-            axis=0,
-        )
         sorted_track_ids = np.array([x.track_id for x in sorted_tracks], dtype=int)
 
-        sorted_features = sorted_features / (
-            np.linalg.norm(sorted_features, axis=1, keepdims=True) + 1e-6
-        )
+        sorted_features = np.stack([x.features[-1] for x in sorted_tracks], axis=0)
+        # sorted_meshes = [x.history[-1].mesh for x in sorted_tracks]
 
         print(
             f"sorted_features={sorted_features.shape} {sorted_boxes.shape} {sorted_positions.shape} {sorted_track_ids.shape}"
@@ -298,6 +505,7 @@ class ConvexHullKalmanTracker:
         suppressed = set()
 
         semantic_overlaps = sorted_features @ sorted_features.T
+        ious = np.zeros_like(semantic_overlaps)
 
         print(
             f"{semantic_overlaps.shape=} {semantic_overlaps.min()} {semantic_overlaps.max()}"
@@ -320,7 +528,18 @@ class ConvexHullKalmanTracker:
                     continue
 
                 iou = self._box_iou_3d(sorted_boxes[i], sorted_boxes[j])
+                # iou = self._convex_hull_iou_trimesh(sorted_meshes[i], sorted_meshes[j])
                 semantic_overlap = semantic_overlaps[i, j]
+
+                ious[i, j] = iou
+                ious[j, i] = iou
+
+                # if (
+                #     iou > self.nms_iou_threshold
+                #     and semantic_overlap < self.nms_semantic_threshold
+                # ):
+                #     print(f"Wouldn't suppress {iou=:.2f} {semantic_overlap=:.2f}")
+                #     suppressed.add(j)
 
                 # Suppress the lower-priority cluster if IoU is high
                 if (
@@ -328,6 +547,10 @@ class ConvexHullKalmanTracker:
                     and semantic_overlap > self.nms_semantic_threshold
                 ):
                     suppressed.add(j)
+
+        for i, track_id in enumerate(sorted_track_ids):
+            self.tracks[track_id].last_iou = np.max(ious[i, :]) # iou with itself is zero as we never check...
+
 
         # Return the kept clusters in original order (not sorted order)
         for idx in suppressed:
@@ -340,7 +563,9 @@ class ConvexHullKalmanTracker:
     def _match_full(self, detections, pose):
         n_dets = len(detections)
 
-        track_idxes = [i for i, track in enumerate(self.tracks) if not track.is_deleted()]
+        track_idxes = [
+            i for i, track in enumerate(self.tracks) if not track.is_deleted()
+        ]
         n_tracks = len(track_idxes)
 
         if n_tracks == 0 or n_dets == 0:
@@ -348,12 +573,11 @@ class ConvexHullKalmanTracker:
             dets_unmatched = set([i for i in range(n_dets)])
 
             return [], list(tracks_unmatched), list(dets_unmatched)
-        
 
         # Calculate IoU matrix
         iou_matrix = np.zeros((n_tracks, n_dets))
         semantic_matrix = np.zeros((n_tracks, n_dets))
-        cost_matrix = np.full((n_tracks, n_dets), 100.0)
+        dist_matrix = np.full((n_tracks, n_dets), 100.0)
         icp_matrix = np.full((n_tracks, n_dets), 100.0)
 
         icp_matrix_max = 0.0
@@ -375,9 +599,10 @@ class ConvexHullKalmanTracker:
         for track_idx in track_idxes:
             track = self.tracks[track_idx]
             # Get predicted bounding box from Kalman filter
-            predicted_center = track.mean[:3]
+            box = track.to_box()
+            predicted_center = box[:3]
 
-            predicted_boxes.append(track.to_box())
+            predicted_boxes.append(box)
 
             predicted_shape = track.to_shape_dict()
 
@@ -387,7 +612,9 @@ class ConvexHullKalmanTracker:
         for i, track_idx in enumerate(track_idxes):
             track = self.tracks[track_idx]
             if track.is_deleted():
-                print(f"Track {track_idx} is deleted. {track.hits=} {track.age=} {track.time_since_update=}")
+                print(
+                    f"Track {track_idx} is deleted. {track.hits=} {track.age=} {track.time_since_update=}"
+                )
                 continue
 
             close_detection_indices = detections_tree.query_ball_point(
@@ -408,81 +635,48 @@ class ConvexHullKalmanTracker:
 
                 # IoU cost
                 iou = 0.0
-                # orig_iou = self._convex_hull_iou_trimesh(predicted_shapes[track_idx]['mesh'], detections[local_det_idx].mesh)
-                # iou = self._box_iou_3d(predicted_boxes[track_idx], detections[local_det_idx].box)
-
                 icp_err = 0.0
-                # ICP cost (simplified - you may want to use your existing ICP function
-                # R, t, _, _, icp_err = rigid_icp(predicted_shape['original_points'], detections[local_det_idx].original_points, max_iterations=5, debug=False, relative=False)
-                # R, t, _, _, icp_err = rigid_icp(predicted_shape['original_points'], detections[local_det_idx].original_points, max_iterations=5, debug=False, relative=False)
-                # R, t, icp_err = icp(predicted_shape['original_points'], detections[local_det_idx].original_points, max_iterations=5, ret_err=True)
+                det_box = detections[local_det_idx].box
+                pred_box = predicted_boxes[i]
 
-                # best
-                    # R, t, A_inliers, B_inliers, icp_err = relative_object_pose(
-                    #     predicted_shape["mesh"].vertices,
-                    #     detections[local_det_idx].mesh.vertices,
-                    #     max_iterations=self.icp_max_iterations,
-                    # )
-
-                    # transform = np.eye(4)
-                    # transform[:3, :3] = R
-                    # transform[:3, 3] = t
-
-                # mesh_projected: trimesh.Trimesh = predicted_shapes[track_idx]['mesh'].copy()
-                # mesh_projected = mesh_projected.apply_transform(transform)
-                # iou = self._convex_hull_iou_trimesh(mesh_projected, detections[local_det_idx].mesh)
-
-                # box iou
-                # box = np.copy(predicted_boxes[track_idx])
-                # box_transformed = register_bbs(box.copy().reshape(1, 7), transform)[0]
-                # box_diff = box_transformed - box
-
-                # iou = self._box_iou_3d(box_transformed, detections[local_det_idx].box)
-
-                iou = self._box_iou_3d(predicted_boxes[i], detections[local_det_idx].box)
-
-                # iou = self._convex_hull_iou_trimesh(predicted_shapes[track_idx]['mesh'], detections[local_det_idx].mesh)
-
-                # box = register_bbs(predicted_boxes[track_idx].reshape(1, 7), transform)[0]
-                # iou = self._box_iou_3d(box, detections[local_det_idx].box)
-
-                # distance = np.linalg.norm(t)
-
-                # if distance > self.track_query_eps:
-                #     continue
-
-                # print(f"distance={distance:.2f} iou={iou:.2f} icp_err={icp_err:.2f} semantic_iou={semantic_iou:.2f}")
-
-                # cost = (
-                #     (1.0 - iou) + (1.0 - semantic_iou) + icp_err
+                # #
+                # R, t, A_inliers, B_inliers, icp_cost = relative_object_pose(
+                #     predicted_shape["mesh"].vertices,
+                #     detections[local_det_idx].mesh.vertices,
+                #     max_iterations=1,
                 # )
-                # cost_matrix[track_idx, local_det_idx] = cost
+                # transform = np.eye(4)
+                # transform[:3, :3] = R
+                # transform[:3, 3] = t
+                # # transform[:3, 3] = (det_box[:3] - pred_box[:3])
+
+                # box = np.copy(pred_box)
+                # box_transformed = register_bbs(box.reshape(1, 7), transform)[0]
+
+                # iou_transformed = self._box_iou_3d(
+                #     box_transformed, detections[local_det_idx].box
+                # )
+
+                iou = self._box_iou_3d(pred_box, det_box)
+
+                # iou = (iou_transformed + iou_default) / 2.0
+
+                distance = np.linalg.norm(pred_box[:6] - det_box[:6])
+
                 iou_matrix[i, local_det_idx] = iou
                 semantic_matrix[i, local_det_idx] = semantic_iou
                 icp_matrix[i, local_det_idx] = icp_err
+                dist_matrix[i, local_det_idx] = distance
                 icp_matrix_max = max(icp_err, icp_matrix_max)
 
-        print("icp_matrix", icp_matrix.shape, icp_matrix.min(), icp_matrix.max())
-        icp_matrix_normed = icp_matrix / (icp_matrix_max + 1e-6)
-        print(
-            f"icp_matrix_normed",
-            icp_matrix_normed.min(),
-            icp_matrix_normed.mean(),
-            icp_matrix_normed.max(),
+
+        print("dist_matrix", dist_matrix.shape, dist_matrix.min(), dist_matrix.max())
+        dist_matrix_normed = dist_matrix / (
+            dist_matrix.max(axis=1, keepdims=True) + 1e-6
         )
 
-        cost_matrix = (1.0 - iou_matrix) + (
-            1.0 - semantic_matrix
-        )  # + icp_matrix_normed
+        cost_matrix = (1.0 - iou_matrix) + (1.0 - semantic_matrix) + dist_matrix_normed
 
-        # track_matches = np.argmin(cost_matrix, axis=1)
-        # track_matches = [i for i, x in enumerate(track_matches) if (iou_matrix[i, x] > (1.0 - self.max_iou_distance)) and (semantic_matrix[i, x] > self.min_semantic_threshold)]
-        # print(f"default matcehes {len(track_matches)}")
-
-        # # Apply Kalman filter gating to semantic costs
-        # cost_matrix = linear_assignment.gate_cost_matrix(
-        #     self.kf, cost_matrix, self.tracks, detections, np.arange(n_tracks),
-        #     np.arange(n_dets))
 
         # compute matches
         track_matches = np.argmin(cost_matrix, axis=1)
@@ -501,8 +695,7 @@ class ConvexHullKalmanTracker:
             # print(f"icp_err={icp_matrix[track_idx, matched_det]}")
             if (
                 iou_matrix[track_i, matched_det] >= self.min_iou_threshold
-                and semantic_matrix[track_i, matched_det]
-                > self.min_semantic_threshold
+                and semantic_matrix[track_i, matched_det] > self.min_semantic_threshold
             ):
                 matches.append((track_idx, matched_det))
 

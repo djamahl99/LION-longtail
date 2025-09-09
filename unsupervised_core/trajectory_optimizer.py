@@ -1,13 +1,14 @@
+from pathlib import Path
+
+import gtsam
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
-import matplotlib.pyplot as plt
-from pathlib import Path
 
-from .box_utils import icp, compute_ppscore
+from .box_utils import compute_ppscore, icp
 
-import gtsam
 
 def optimize_with_gtsam_timed(initial_poses, constraints, timestamps_ns):
     """
@@ -38,11 +39,14 @@ def optimize_with_gtsam_timed(initial_poses, constraints, timestamps_ns):
     
     # 2. Create initial estimates
     initial_estimate = gtsam.Values()
+
+    trans_sigma = 1.0
+    rot_sigma = 1.0
     
     # 3. Add prior on first pose (fix it as reference frame)
     # For Pose3: 6 DOF - 3 rotation, 3 translation
     prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
-        np.array([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])
+        np.array([0.0, 0.0, rot_sigma, trans_sigma, trans_sigma, trans_sigma])
     )
     graph.add(gtsam.PriorFactorPose3(0, gtsam.Pose3(initial_poses[0]), prior_noise))
     
@@ -60,15 +64,15 @@ def optimize_with_gtsam_timed(initial_poses, constraints, timestamps_ns):
         dt = abs(timestamps[j] - timestamps[i])
         time_factor = 1.0 + dt * 0.1  # Increase uncertainty with time gap
         
-        # Create noise model based on confidence and time
-        base_sigma = 1.0 / (confidence + 1e-6)
+        # # Create noise model based on confidence and time
+        # base_sigma = 1.0 / (confidence + 1e-6)
         
-        # Different uncertainty for rotation (first 3) vs translation (last 3)
-        rot_sigma = base_sigma * time_factor * 0.1  # radians
-        trans_sigma = base_sigma * time_factor * 0.01  # meters
+        # # Different uncertainty for rotation (first 3) vs translation (last 3)
+        # rot_sigma = base_sigma * time_factor * 0.1  # radians
+        # trans_sigma = base_sigma * time_factor * 0.01  # meters
         
         noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([rot_sigma, rot_sigma, rot_sigma,
+            np.array([0.0, 0.0, rot_sigma,
                      trans_sigma, trans_sigma, trans_sigma])
         )
         
@@ -157,7 +161,7 @@ def optimize_with_gtsam_timed_positions(initial_positions, constraints, timestam
     
     # 5. ENFORCE: Add strong priors to keep rx=0, ry=0 for ALL poses
     zero_pitch_roll_noise = gtsam.noiseModel.Diagonal.Sigmas(
-        np.array([0.001, 0.001, 10.0, 0.1, 0.1, 0.1])  # Very tight on rx,ry; loose on rz,x,y,z
+        np.array([0.0, 0.0, 10.0, 0.1, 0.1, 0.1])  # Very tight on rx,ry; loose on rz,x,y,z
     )
     
     for i in range(1, n_poses):  # Skip first pose (already has prior)

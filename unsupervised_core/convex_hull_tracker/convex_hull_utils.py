@@ -4,8 +4,23 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
-from lion.unsupervised_core.outline_utils import voxel_sampling
 
+def voxel_sampling_fast(points, res_x=0.1, res_y=0.1, res_z=0.1):
+    """Ultra-fast vectorized voxel sampling"""
+    if len(points) == 0:
+        return points
+    
+    # Vectorized voxel coordinate computation
+    mins = points.min(axis=0)
+    voxel_coords = ((points - mins) / [res_x, res_y, res_z]).astype(np.int32)
+    
+    # Create unique voxel indices using numpy
+    _, unique_indices, inverse_indices = np.unique(
+        voxel_coords, axis=0, return_index=True, return_inverse=True
+    )
+    
+    # Option 1: Take first point in each voxel (fastest)
+    return points[unique_indices]
 
 def analytical_y_rotation(
     A: np.ndarray, B: np.ndarray
@@ -208,8 +223,8 @@ def relative_object_pose(
     B = np.copy(points2)
 
     # simplify
-    A = voxel_sampling(A, 0.05, 0.05, 0.05)
-    B = voxel_sampling(B, 0.05, 0.05, 0.05)
+    A = voxel_sampling_fast(A, 0.05, 0.05, 0.05)
+    B = voxel_sampling_fast(B, 0.05, 0.05, 0.05)
 
     # Check if points are actually centered
     centroid_A = np.mean(A, axis=0)

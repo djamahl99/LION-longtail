@@ -21,12 +21,14 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 from pprint import pprint
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import cv2
 import matplotlib
 import numpy as np
 import pandas as pd
 import torch
+import trimesh
 import yaml
 from easydict import EasyDict
 from scipy.spatial import ConvexHull, cKDTree
@@ -40,13 +42,15 @@ import av2.geometry.polyline_utils as polyline_utils
 import av2.rendering.vector as vector_plotting_utils
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
+from av2.datasets.sensor.constants import RingCameras
 from av2.evaluation import SensorCompetitionCategories
+from av2.geometry.camera.pinhole_camera import PinholeCamera
 from av2.map.lane_segment import LaneSegment
 from av2.map.map_api import ArgoverseStaticMap, GroundHeightLayer
 
 # from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from av2.structures.sweep import Sweep
-from av2.utils.io import read_city_SE3_ego
+from av2.utils.io import read_city_SE3_ego, read_ego_SE3_sensor, read_feather
 from scipy.spatial.distance import cdist
 from scipy.stats import entropy
 from sklearn.ensemble import RandomForestRegressor
@@ -84,6 +88,8 @@ from lion.unsupervised_core.outline_utils import (
     smooth_points_and_ppscore,
 )
 from lion.unsupervised_core.rotate_iou_cpu_eval import rotate_iou_cpu_eval
+
+np.set_printoptions(suppress=True, precision=2)
 
 # Remove position-based features that shouldn't affect quality
 IGNORE_COLS = [
@@ -861,6 +867,8 @@ def load_and_plot_objects(
     print("outline_scores", len(outline_scores))
     print("outline_scores", outline_scores)
 
+    print("outline_boxes", outline_boxes)
+
     outline_boxes_filtered = [
         x for x, y in zip(outline_boxes, outline_scores) if y > score_thresh
     ]
@@ -1564,6 +1572,220 @@ def load_and_plot_alpha_shapes(
     print(f"Alpha shapes in reference frame: {len(alpha_shapes)}")
 
     return alpha_shape_infos
+
+
+def load_and_plot_alpha_shapes_camera(
+    output_info_path: str,
+    use_first_frame: bool = True,
+    ref_frame_idx: int = None,
+    plot_trajectories: bool = True,
+    figsize: Tuple = (12, 10),
+    save_path: Optional[str] = None,
+    gts_dataframe=None,
+    ref_timestamp_ns: Optional[int] = None,
+    log_id: str = "",
+    score_thresh: float = -1,
+) -> Dict:
+    """
+    Load and plot alpha shapes in BEV.
+
+    Args:
+        output_info_path: Path to the pickle file containing alpha shape info
+        use_first_frame: If True, use first frame as reference
+        plot_trajectories: Whether to plot object trajectories
+        figsize: Figure size for the plot
+        save_path: Optional path to save the plot
+        gts_dataframe: Ground truth dataframe in Argoverse 2 format
+        ref_timestamp_ns: Specific timestamp for GT filtering
+        log_id: Log ID for filtering
+        score_thresh: Score threshold for filtering
+
+    Returns:
+        Loaded alpha shape information
+    """
+    # Load the pickle file
+    if not os.path.exists(output_info_path):
+        raise FileNotFoundError(f"Output info path not found: {output_info_path}")
+
+    with open(output_info_path, "rb") as f:
+        alpha_shape_infos = pkl.load(f)
+
+    print(f"Loaded {len(alpha_shape_infos)} frames of alpha shape data")
+
+    # Extract trajectories
+    object_trajectories = defaultdict(list)
+    object_frames = defaultdict(list)
+    frame_object_counts = []
+
+    log_dir = Path("/home/uqdetche/lidar_longtail_mining/lion/data/argo2/sensor/val") / log_id
+    raster_ground_height_layer = GroundHeightLayer.from_file(log_dir / "map")
+
+    for frame_idx, frame_info in enumerate(alpha_shape_infos):
+        alpha_shapes = frame_info.get("alpha_shapes", [])
+        alpha_ids = frame_info.get("outline_ids", [])
+        alpha_poses = frame_info.get("outline_poses", [])
+        timestamp = frame_info['timestamp_ns']
+        frame_object_counts.append(len(alpha_shapes))
+
+        for alpha_id, alpha_pose in zip(alpha_ids, alpha_poses):
+
+            object_frames[alpha_id].append(timestamp)
+            object_trajectories[alpha_id].append(alpha_pose[:3, 3])
+
+    for k in object_trajectories.keys():
+        object_trajectories[k] = np.array(object_trajectories[k])
+
+    # Choose reference frame
+    if ref_frame_idx is None or (use_first_frame or len(frame_object_counts) == 0):
+        ref_frame_idx = 0
+    elif ref_frame_idx is None:
+        ref_frame_idx = np.argmax(frame_object_counts)
+
+    # Plot alpha shapes from reference frame
+    ref_frame_info = alpha_shape_infos[ref_frame_idx]
+    alpha_shapes = ref_frame_info.get("alpha_shapes", [])
+    alpha_ids = ref_frame_info.get("outline_ids", [])
+    pose = ref_frame_info.get("pose", np.eye(4))
+
+    sweep_timestamp_ns = ref_frame_info['timestamp_ns']
+
+    valid_obj_ids = list(object_frames.keys())
+
+    # filter trajectories in place
+    object_trajectories = {
+        obj_id: object_trajectories[obj_id] for obj_id in valid_obj_ids
+    }
+
+    print(
+        f"Using frame {ref_frame_idx} as reference (contains {frame_object_counts[ref_frame_idx]} alpha shapes)"
+    )
+
+    print(f"Plotting {len(alpha_shapes)} alpha shapes {len(alpha_ids)} alpha ids")
+
+    ring_cameras = [x.value for x in list(RingCameras)]
+    # avm = ArgoverseStaticMap.from_map_dir(log_dir / "map", build_raster=True)
+
+    camera_models = {
+        cam_name: PinholeCamera.from_feather(log_dir=log_dir, cam_name=cam_name)
+        for cam_name in ring_cameras
+    }
+    timestamp_city_SE3_ego_dict = read_city_SE3_ego(log_dir=log_dir)
+
+
+    # Ggather all cameras and timestamps
+    sensor_dir = log_dir / "sensors"
+    cameras_dir = sensor_dir / "cameras"
+
+    # TODO
+    src_sensor_name = "lidar"
+    synchronization_cache_path = (
+        Path.home() / ".cache" / "av2" / "synchronization_cache.feather"
+    )
+    synchronization_cache = read_feather(synchronization_cache_path)
+    # Finally, create a MultiIndex set the sync records index and sort it.
+    synchronization_cache.set_index(
+        keys=["split", "log_id", "sensor_name"], inplace=True
+    )
+    synchronization_cache.sort_index(inplace=True)
+
+    src_timedelta_ns = pd.Timedelta(sweep_timestamp_ns)
+
+    for camera_name in ring_cameras:
+        camera_dir = cameras_dir / camera_name
+
+        src_to_target_records = synchronization_cache.loc[
+            ("val", log_id, src_sensor_name)
+        ].set_index(src_sensor_name)
+        index = src_to_target_records.index
+        if src_timedelta_ns not in index:
+            # This timestamp does not correspond to any lidar sweep.
+            continue
+
+        # Grab the synchronization record.
+        target_timestamp_ns = src_to_target_records.loc[
+            src_timedelta_ns, camera_name
+        ]
+        if pd.isna(target_timestamp_ns):
+            # No match was found within tolerance.
+            continue
+        cam_timestamp_ns_str = str(target_timestamp_ns.asm8.item())
+
+        city_SE3_ego_cam_t = timestamp_city_SE3_ego_dict[target_timestamp_ns.asm8.item()]
+        city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[sweep_timestamp_ns]
+        camera_model = camera_models[camera_name]
+
+
+        image_path = camera_dir / f"{cam_timestamp_ns_str}.jpg"
+
+        img_vis = cv2.imread(str(image_path))
+
+        height, width = img_vis.shape[:2]
+        instance_mask = np.zeros((height, width), dtype=np.int32)
+        depth_buffer = np.full((height, width), np.inf)  # Z-buffer for occlusion handling
+        rendered_image = np.zeros_like(img_vis)
+        rendered_mask = np.zeros((height, width), dtype=bool)
+        
+        
+        cmap = plt.get_cmap("tab20", len(alpha_shapes))
+        
+        for shape_id, alpha_shape in enumerate(alpha_shapes):
+            vertices = alpha_shape['vertices_3d']
+            
+            mesh = trimesh.convex.convex_hull(vertices)
+
+            (
+                uv_points,
+                points_cam,
+                is_valid_points,
+            ) = camera_model.project_ego_to_img_motion_compensated(
+                mesh.vertices,
+                city_SE3_ego_cam_t=city_SE3_ego_cam_t,
+                city_SE3_ego_lidar_t=city_SE3_ego_lidar_t,
+            )
+            
+            color = cmap(shape_id)
+            color = tuple((np.array(color)[:3]*255).astype(int).tolist())
+            
+            uvs = uv_points[:, :2]
+            depths = points_cam[:, 2]
+            cam_mask = is_valid_points
+
+            # Render each triangular face
+            for face in mesh.faces:
+                # Get the vertices of the triangle
+                tri_verts_2d = uvs[face]  # (3, 2): Triangle in 2D space
+                tri_depths = depths[face]  # (3,): Depth of the triangle vertices
+                tri_mask = cam_mask[face]
+                
+                # Compute the average depth of the triangle
+                avg_depth = np.mean(tri_depths)
+                
+                # if avg_depth < 0:
+                if np.any(tri_depths < 0) or not np.all(tri_mask):
+                    # print('tri_depths', tri_depths)
+                    continue
+                
+                # Create a mask for the triangle
+                tri_mask = np.zeros((height, width), dtype=np.uint8)
+                tri_verts_2d = tri_verts_2d.astype(int)
+                cv2.fillConvexPoly(tri_mask, tri_verts_2d, 1)
+                
+                # Find pixels where this triangle is visible (closer than current depth buffer)
+                visible_pixels = (tri_mask > 0) & (avg_depth < depth_buffer)
+                
+                # Update depth buffer, instance mask, and rendered image for visible pixels
+                depth_buffer[visible_pixels] = avg_depth
+                instance_mask[visible_pixels] = shape_id
+                rendered_image[visible_pixels] = color  # Example color for this alpha shape
+                rendered_mask[visible_pixels] = True
+                
+        opacity = 0.7
+        blended_image = cv2.addWeighted(rendered_image, opacity, img_vis, 1 - opacity, 0)
+        result = img_vis.copy()
+        result[rendered_mask] = blended_image[rendered_mask]
+
+        cv2.imwrite(save_path.replace(".png", f"_{camera_name}.png"), result)
+        cv2.imwrite(save_path.replace(".png", f"_{camera_name}_orig.png"), img_vis)
 
 
 def analyze_object_data(output_info_path):
@@ -3621,9 +3843,12 @@ def extract_all_features_accurate(
             ]
         )
 
-        assert gt_count > 0
-        frame_object_counts.append(gt_count)
+        frame_object_counts.append(len(frame_info.get("outline_box", [])))
         continue
+
+        # assert gt_count > 0
+        # frame_object_counts.append(gt_count)
+        # continue
 
         outline_boxes = frame_info.get("outline_box", [])
         outline_ids = frame_info.get("outline_ids", [])
@@ -5188,8 +5413,8 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     for log_id in log_ids:
         output_path = get_owl_alpha_shape_output_path(output_dir, log_id)
 
-        # if output_path.exists():
-        #     os.remove(output_path)
+        if output_path.exists():
+            os.remove(output_path)
 
         if output_path.exists():
             print(f"{output_path=}")
@@ -5203,14 +5428,15 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     print(f"{len(owlvit_log_ids)=}")
     # exit()
 
-    vis_log_id = None
+    vis_log_id = '42f92807-0c5e-3397-bd45-9d5303b4db2a'
+    vis_log_id = 'c2d44a70-9fd4-3298-ad0a-c4c9712e6f1e'
 
     not_done_log_ids = list(set(owlvit_log_ids).difference(owlvit_alpha_shape_log_ids))
     print(f"not_done_log_ids {len(not_done_log_ids)}")
 
     if len(owlvit_alpha_shape_log_ids) == 0 or True:
         # for log_id in [np.random.choice(not_done_log_ids)]:  # TODO: do all
-        for log_id in ['42f92807-0c5e-3397-bd45-9d5303b4db2a']:
+        for log_id in [vis_log_id]:
             # pr = cProfile.Profile()
             # pr.enable()
             print(f"running on {log_id=}")
@@ -5276,6 +5502,15 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
         log_id=vis_log_id,
     )
 
+    outline_infos = load_and_plot_alpha_shapes_camera(
+        vis_path,
+        use_first_frame=False,  # Use frame with most objects
+        plot_trajectories=True,
+        gts_dataframe=gts.copy(),  # Add GT overlay
+        save_path="owlvit_alpha_shape_bev_visualization.png",
+        log_id=vis_log_id,
+    )
+
     alpha_shape_vis_path = Path("./owlvit_alpha_shapes_vis")
     alpha_shape_vis_path.mkdir(exist_ok=True)
 
@@ -5312,8 +5547,8 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
             )
 
             # TODO: COMMENT OUT LATER
-            # if cur_features_output_path.exists():
-            #     os.remove(cur_features_output_path)
+            if cur_features_output_path.exists():
+                os.remove(cur_features_output_path)
 
             if not cur_features_output_path.exists():
                 df_features = extract_all_features_accurate(
@@ -5325,6 +5560,7 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
                     category_mapping=category_mapping,
                     gts_dataframe=gts.copy(),
                     score_thresh=-1,  # no score thresh
+                    # use_first_frame=True
                 )
             else:
                 df_features = pd.read_feather(cur_features_output_path)
