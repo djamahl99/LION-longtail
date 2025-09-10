@@ -2,7 +2,6 @@ import numpy as np
 import scipy.linalg
 from scipy.spatial.transform import Rotation
 
-
 """
 Table for the 0.95 quantile of the chi-square distribution with N degrees of
 freedom (contains values for N=1, ..., 9). Taken from MATLAB/Octave's chi2inv
@@ -19,24 +18,19 @@ chi2inv95 = {
     8: 15.507,
     9: 16.919}
 
+def wrap_angle(yaw):
+    return np.arctan2(np.sin(yaw), np.cos(yaw))
 
 class PoseKalmanFilter(object):
     """
     A Kalman filter for tracking 3D object pose (position and rotation).
 
-    The 12-dimensional state space
+    The 8-dimensional state space
 
-        x, y, z, rx, ry, rz, vx, vy, vz, vrx, vry, vrz
-
-    contains the 3D position (x, y, z), rotation vector (rx, ry, rz) in axis-angle
-    representation, and their respective velocities.
-
-    Object motion follows a constant velocity model. The pose parameters
-    (x, y, z, rx, ry, rz) are taken as direct observation of the state space.
-
+        x, y, z, rz, vx, vy, vz, vrz
     """
 
-    def __init__(self, dt=1.0):
+    def __init__(self, dt=0.1):
         """
         Initialize the Kalman filter.
         
@@ -45,14 +39,19 @@ class PoseKalmanFilter(object):
         dt : float
             Time step between measurements (default: 0.1)
         """
-        ndim = 6  # [x, y, z, rx, ry, rz]
+        self.ndim = 4  # [x, y, z, rz]
         self.dt = dt
 
-        # Create Kalman filter model matrices.
-        self._motion_mat = np.eye(2 * ndim, 2 * ndim)
-        for i in range(ndim):
-            self._motion_mat[i, ndim + i] = dt
-        self._update_mat = np.eye(ndim, 2 * ndim)
+        # Motion model: position + heading with velocities
+        self._motion_mat = np.eye(8, 8)
+        # Position integration: pos(t+1) = pos(t) + vel(t)*dt
+        self._motion_mat[0, 4] = dt  # x += vx*dt
+        self._motion_mat[1, 5] = dt  # y += vy*dt  
+        self._motion_mat[2, 6] = dt  # z += vz*dt
+        self._motion_mat[3, 7] = dt  # yaw += vyaw*dt
+        
+        # Observation matrix: we observe [x, y, z, yaw]
+        self._update_mat = np.eye(4, 8)
 
         # Standard deviations for different parameter types
         self.std_pos = 1.0        # meters for x, y, z
@@ -67,38 +66,21 @@ class PoseKalmanFilter(object):
         return self.initiate(measurement)
 
     def initiate(self, measurement):
-        """Create track from unassociated measurement (absolute pose).
-
-        Parameters
-        ----------
-        measurement : ndarray or 4x4 matrix
-            Either 6D pose vector (x, y, z, rx, ry, rz) where rx,ry,rz is rotation
-            vector, or 4x4 transformation matrix
-
-        Returns
-        -------
-        (ndarray, ndarray)
-            Returns the mean vector (12 dimensional) and covariance matrix (12x12
-            dimensional) of the new track. Unobserved velocities are initialized
-            to 0 mean.
-
-        """
-        if measurement.shape == (4, 4):
-            measurement = PoseKalmanFilter.transform_to_pose_vector(measurement)
+        # measurement is [x, y, z, yaw]
+        mean_pos = measurement  # [x, y, z, yaw]
+        mean_vel = np.zeros(4)   # [vx, vy, vz, vyaw] 
+        mean = np.concatenate([mean_pos, mean_vel])
         
-        mean_pos = measurement
-        mean_vel = np.zeros_like(mean_pos)
-        mean = np.r_[mean_pos, mean_vel]
-
-        # Standard deviations for initial uncertainty
+        # Initial uncertainties
         std = [
-            # Position uncertainties (x, y, z)
-            self.std_pos, self.std_pos, self.std_pos,
-            # Rotation uncertainties (rx, ry, rz)
-            self.std_rot, self.std_rot, self.std_rot,
-            # Velocity uncertainties
-            self.std_vel_pos, self.std_vel_pos, self.std_vel_pos,  # vx, vy, vz
-            self.std_vel_rot, self.std_vel_rot, self.std_vel_rot,  # vrx, vry, vrz
+            1.0,  # x position
+            1.0,  # y position
+            0.5,  # z position (more certain - terrain constrained)
+            0.1,  # yaw 
+            2.0,  # vx velocity
+            2.0,  # vy velocity
+            1.0,  # vz velocity (smaller - terrain constrained)
+            0.2   # vyaw rate
         ]
         
         covariance = np.diag(np.square(std))
@@ -125,9 +107,9 @@ class PoseKalmanFilter(object):
         """
         # Process noise standard deviations (typically smaller than initial uncertainty)
         std_pos = [self.std_pos * 0.3, self.std_pos * 0.3, self.std_pos * 0.3]  # x, y, z
-        std_rot = [self.std_rot * 0.3, self.std_rot * 0.3, self.std_rot * 0.3]  # rx, ry, rz
+        std_rot = [self.std_rot * 0.3]  # rz
         std_vel_pos = [self.std_vel_pos * 0.3, self.std_vel_pos * 0.3, self.std_vel_pos * 0.3]  # vx, vy, vz
-        std_vel_rot = [self.std_vel_rot * 0.3, self.std_vel_rot * 0.3, self.std_vel_rot * 0.3]  # vrx, vry, vrz
+        std_vel_rot = [self.std_vel_rot * 0.3]  # vrz
         
         motion_cov = np.diag(np.square(np.r_[std_pos, std_rot, std_vel_pos, std_vel_rot]))
 
@@ -157,7 +139,7 @@ class PoseKalmanFilter(object):
         # Measurement noise standard deviations
         std = [
             self.std_pos, self.std_pos, self.std_pos,        # x, y, z
-            self.std_rot, self.std_rot, self.std_rot,        # rx, ry, rz
+            self.std_rot,        # rz
         ]
         innovation_cov = np.diag(np.square(std))
 
@@ -166,112 +148,34 @@ class PoseKalmanFilter(object):
             self._update_mat, covariance, self._update_mat.T))
         return mean, covariance + innovation_cov
 
-    def update(self, mean, covariance, measurement, is_relative=False):
-        """Run Kalman filter correction step.
-
-        Parameters
-        ----------
-        mean : ndarray
-            The predicted state's mean vector (12 dimensional).
-        covariance : ndarray
-            The state's covariance matrix (12x12 dimensional).
-        measurement : ndarray or 4x4 matrix
-            Either 6D pose vector (x, y, z, rx, ry, rz) or 4x4 transformation matrix.
-            If is_relative=True, this represents the relative transformation since
-            the last update. If False, it's an absolute pose measurement.
-        is_relative : bool
-            If True, measurement is a relative transformation. If False, it's absolute.
-
-        Returns
-        -------
-        (ndarray, ndarray)
-            Returns the measurement-corrected state distribution.
-
-        """
-        if measurement.shape == (4, 4):
-            measurement = PoseKalmanFilter.transform_to_pose_vector(measurement)
-            
-        if is_relative:
-            # Convert relative measurement to absolute by applying it to current state
-            current_pose = mean[:6]
-            current_transform = PoseKalmanFilter.pose_vector_to_transform(current_pose)
-            relative_transform = PoseKalmanFilter.pose_vector_to_transform(measurement)
-            new_transform = current_transform @ relative_transform
-            measurement = PoseKalmanFilter.transform_to_pose_vector(new_transform)
+    def update(self, mean, covariance, measurement):
+        assert mean.shape == (8,) and covariance.shape == (8,8)
         
         projected_mean, projected_cov = self.project(mean, covariance)
-
-        chol_factor, lower = scipy.linalg.cho_factor(
-            projected_cov, lower=True, check_finite=False)
-        kalman_gain = scipy.linalg.cho_solve(
-            (chol_factor, lower), np.dot(covariance, self._update_mat.T).T,
-            check_finite=False).T
+        
+        # Handle yaw wraparound in innovation
         innovation = measurement - projected_mean
-
-        new_mean = mean + np.dot(innovation, kalman_gain.T)
-        new_covariance = covariance - np.linalg.multi_dot((
-            kalman_gain, projected_cov, kalman_gain.T))
+        # innovation[3] = wrap_angle(measurement[3] - projected_mean[3])
+        
+        # Cleaner Kalman gain computation
+        kalman_gain = covariance @ self._update_mat.T @ np.linalg.inv(projected_cov)
+        
+        # Or for numerical stability, use your Cholesky approach more directly:
+        # kalman_gain = scipy.linalg.cho_solve(
+        #     (chol_factor, lower), 
+        #     self._update_mat @ covariance
+        # ).T
+        
+        new_mean = mean + kalman_gain @ innovation  # More standard notation
+        new_mean[3] = wrap_angle(new_mean[3])
+        
+        new_covariance = covariance - kalman_gain @ projected_cov @ kalman_gain.T
+        
         return new_mean, new_covariance
 
-    def gating_distance(self, mean, covariance, measurements,
-                        only_position=False, is_relative=False):
-        """Compute gating distance between state distribution and measurements.
-
-        A suitable distance threshold can be obtained from `chi2inv95`. If
-        `only_position` is False, the chi-square distribution has 6 degrees of
-        freedom, otherwise 3.
-
-        Parameters
-        ----------
-        mean : ndarray
-            Mean vector over the state distribution (12 dimensional).
-        covariance : ndarray
-            Covariance of the state distribution (12x12 dimensional).
-        measurements : ndarray
-            An Nx6 dimensional matrix of N measurements, each in
-            format (x, y, z, rx, ry, rz).
-        only_position : Optional[bool]
-            If True, distance computation is done with respect to the 3D
-            position (x, y, z) only.
-        is_relative : bool
-            If True, measurements are relative transformations.
-
-        Returns
-        -------
-        ndarray
-            Returns an array of length N, where the i-th element contains the
-            squared Mahalanobis distance between (mean, covariance) and
-            `measurements[i]`.
-
-        """
-        assert ((measurements.shape[-1] == 6) and not only_position) or ((measurements.shape[-1] == 3) and only_position)
-        if is_relative:
-            # Convert relative measurements to absolute
-            current_pose = mean[:6]
-            current_transform = PoseKalmanFilter.pose_vector_to_transform(current_pose)
-            absolute_measurements = []
-            for measurement in measurements:
-                relative_transform = PoseKalmanFilter.pose_vector_to_transform(measurement)
-                new_transform = current_transform @ relative_transform
-                absolute_measurements.append(PoseKalmanFilter.transform_to_pose_vector(new_transform))
-            measurements = np.array(absolute_measurements)
-            
-        mean, covariance = self.project(mean, covariance)
-        if only_position:
-            mean, covariance = mean[:3], covariance[:3, :3]
-            measurements = measurements[:, :3]
-
-        cholesky_factor = np.linalg.cholesky(covariance)
-        d = measurements - mean
-        z = scipy.linalg.solve_triangular(
-            cholesky_factor, d.T, lower=True, check_finite=False,
-            overwrite_b=True)
-        squared_maha = np.sum(z * z, axis=0)
-        return squared_maha
-
-    @staticmethod
-    def box_to_pose_vector(box: np.ndarray):
-        return np.array([box[0], box[1], box[2], 0.0, 0.0, box[-1]], dtype=np.float32)
+    @staticmethod  
+    def box_to_pose_vector(box):
+        return np.array([box[0], box[1], box[2], box[6]])  # [x, y, z, yaw]
 
     @staticmethod
     def pose_vector_to_transform(pose_vector):
@@ -280,20 +184,21 @@ class PoseKalmanFilter(object):
         Parameters
         ----------
         pose_vector : ndarray
-            6D vector [x, y, z, rx, ry, rz] where rx,ry,rz is rotation vector
+            4D vector [x, y, z, rz] where 0,0,rz is rotation vector
             
         Returns
         -------
         ndarray
             4x4 transformation matrix
         """
-        assert len(pose_vector) == 6, f"pose_vector={np.round(pose_vector, 2)}"
+        assert len(pose_vector) == 4, f"pose_vector={np.round(pose_vector, 2)}"
 
         T = np.eye(4)
         T[:3, 3] = pose_vector[:3]  # translation
         
         # Convert rotation vector to rotation matrix
-        rotation_vector = pose_vector[3:6]
+        rotation_vector = np.zeros((3,))
+        rotation_vector[2] = pose_vector[3]
         if np.linalg.norm(rotation_vector) > 1e-8:
             T[:3, :3] = Rotation.from_rotvec(rotation_vector).as_matrix()
             
@@ -311,81 +216,13 @@ class PoseKalmanFilter(object):
         Returns
         -------
         ndarray
-            6D pose vector [x, y, z, rx, ry, rz]
+            4D pose vector [x, y, z, rz]
         """
-        pose_vector = np.zeros(6)
+        pose_vector = np.zeros(4)
         pose_vector[:3] = transform[:3, 3]  # translation
         
         # Convert rotation matrix to rotation vector
         rotation_matrix = transform[:3, :3]
-        pose_vector[3:6] = Rotation.from_matrix(rotation_matrix).as_rotvec()
+        pose_vector[3] = Rotation.from_matrix(rotation_matrix).as_rotvec()[2]
         
         return pose_vector
-
-    def get_transform_matrix(self):
-        """Get 4x4 transformation matrix from current state mean.
-                    
-        Returns
-        -------
-        ndarray
-            4x4 transformation matrix representing current pose
-        """
-        pose_vector = self.mean[:6]
-        return PoseKalmanFilter.pose_vector_to_transform(pose_vector)
-
-    def set_noise_params(self, std_pos=None, std_rot=None,
-                        std_vel_pos=None, std_vel_rot=None):
-        """Update noise parameters.
-        
-        Parameters
-        ----------
-        std_pos : float, optional
-            Standard deviation for position (x, y, z) in meters
-        std_rot : float, optional  
-            Standard deviation for rotation (rx, ry, rz) in radians
-        std_vel_pos : float, optional
-            Standard deviation for position velocities in m/s
-        std_vel_rot : float, optional
-            Standard deviation for rotation velocities in rad/s
-        """
-        if std_pos is not None:
-            self.std_pos = std_pos
-        if std_rot is not None:
-            self.std_rot = std_rot
-        if std_vel_pos is not None:
-            self.std_vel_pos = std_vel_pos
-        if std_vel_rot is not None:
-            self.std_vel_rot = std_vel_rot
-
-
-# Example usage
-if __name__ == "__main__":
-    # Create Kalman filter
-    kf = PoseKalmanFilter(dt=0.1)  # 10 Hz updates
-    
-    # Example initial pose: [x, y, z, rx, ry, rz]
-    initial_pose = np.array([10.0, 5.0, 1.5, 0.1, 0.2, 0.3])
-    
-    # Initialize track with absolute pose
-    mean, covariance = kf.initiate(initial_pose)
-    print("Initial pose:", mean[:6])
-    print("Initial 4x4 transform:\n", kf.get_transform_matrix())
-    
-    # Simulate a few prediction/update cycles with relative measurements
-    for i in range(5):
-        # Predict
-        mean, covariance = kf.predict(mean, covariance)
-        print(f"\nPredicted pose {i+1}:", mean[:6])
-        
-        # Simulate relative measurement (small movement)
-        relative_pose = np.array([0.1, 0.02, 0.01, 0.01, 0.005, 0.02])
-        
-        # Update with relative measurement
-        mean, covariance = kf.update(mean, covariance, relative_pose, is_relative=True)
-        print(f"Updated pose {i+1}:", mean[:6])
-        print(f"Velocity {i+1}:", mean[6:])
-        
-        # Show as transformation matrix
-        T = kf.get_transform_matrix()
-        print(f"Transform matrix {i+1}:")
-        print(T)

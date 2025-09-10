@@ -95,16 +95,16 @@ class ConvexHullKalmanTracker:
         self.track_query_eps = 3.0  # metres
         self.max_iou_distance = 0.9
 
-        self.min_semantic_threshold = 0.7
-        self.min_iou_threshold = 0.1
+        self.min_semantic_threshold = 0.9
+        self.min_iou_threshold = 0.3
         self.min_box_iou = 0.1
 
         self.icp_max_dist = 1.0
         self.icp_max_iterations = 10
 
-        self.nms_iou_threshold = 0.3
+        self.nms_iou_threshold = 0.7
         self.nms_semantic_threshold: float = 0.9
-        self.nms_query_distance: float = 15.0
+        self.nms_query_distance: float = 5.0
         self.n_points_err_thresh = 0.3
 
         self.min_component_points = 10
@@ -177,7 +177,7 @@ class ConvexHullKalmanTracker:
         #     if track.is_deleted():
         #         continue
 
-        #     pos = track.mean[:3]
+        #     pos = track.mean[:3] # change to box[:3]
         #     radius = np.linalg.norm(track.lwh * 0.5)
 
         #     lidar_indices = lidar_tree.query_ball_point(pos, radius)
@@ -604,10 +604,10 @@ class ConvexHullKalmanTracker:
 
             predicted_boxes.append(box)
 
-            predicted_shape = track.to_shape_dict()
+            # predicted_shape = track.to_shape_dict()
 
             predicted_centroids.append(predicted_center)
-            predicted_shapes.append(predicted_shape)
+            # predicted_shapes.append(predicted_shape)
 
         for i, track_idx in enumerate(track_idxes):
             track = self.tracks[track_idx]
@@ -621,7 +621,7 @@ class ConvexHullKalmanTracker:
                 predicted_centroids[i], self.track_query_eps
             )
 
-            predicted_shape = predicted_shapes[i]
+            # predicted_shape = predicted_shapes[i]
 
             for local_det_idx in close_detection_indices:
                 # Compute geometric costs
@@ -687,6 +687,7 @@ class ConvexHullKalmanTracker:
 
         matched_tracks = set()
         matched_dets = set()
+        match_ious = []
 
         matches = []
         for track_i, matched_det in enumerate(track_matches):
@@ -701,6 +702,7 @@ class ConvexHullKalmanTracker:
 
                 matched_tracks.add(track_idx)
                 matched_dets.add(matched_det)
+                match_ious.append(iou_matrix[track_i, matched_det])
 
         tracks_unmatched = track_set.difference(matched_tracks)
         dets_unmatched = det_set.difference(matched_dets)
@@ -710,202 +712,10 @@ class ConvexHullKalmanTracker:
         )
         print(f"matched_dets: {len(matched_dets)} dets_unmatched {len(dets_unmatched)}")
 
+        match_ious = np.array(match_ious)
+        print("match_ious", match_ious.min(), np.median(match_ious), np.max(match_ious))
+
         return matches, list(tracks_unmatched), list(dets_unmatched)
-
-    def _match(self, detections, pose):
-        """Hybrid matching that combines semantic features, Kalman filtering, and geometric analysis."""
-
-        def enhanced_gated_metric(tracks, dets, track_indices, detection_indices):
-            """Enhanced gating that combines semantic, spatial, and geometric costs."""
-            # Original semantic distance matrix
-            features = np.array([dets[i].feature for i in detection_indices])
-            targets = np.array([tracks[i].track_id for i in track_indices])
-            semantic_cost_matrix = self.metric.distance(features, targets)
-
-            # Apply Kalman filter gating to semantic costs
-            semantic_cost_matrix = linear_assignment.gate_cost_matrix(
-                self.kf,
-                semantic_cost_matrix,
-                tracks,
-                dets,
-                track_indices,
-                detection_indices,
-            )
-
-            # If no valid detections after gating, return semantic costs
-            if len(detection_indices) == 0 or len(track_indices) == 0:
-                return semantic_cost_matrix
-
-            # Prepare for geometric analysis
-            detection_centroids = []
-
-            for det_idx in detection_indices:
-                detection = dets[det_idx]
-                detection_centroids.append(detection.centroid_3d)
-
-            # Build KDTree for spatial queries
-            if len(detection_centroids) > 0:
-                detections_tree = cKDTree(detection_centroids)
-
-            # Predict track positions and shapes using Kalman + pose transformation
-            predicted_centroids = []
-            predicted_alpha_shapes = []
-
-            for track_idx in track_indices:
-                track = tracks[track_idx]
-
-                # Get predicted bounding box from Kalman filter
-                predicted_center = track.mean[:3]
-
-                predicted_shape = track.to_shape_dict()
-
-                predicted_centroids.append(predicted_center)
-                predicted_alpha_shapes.append(predicted_shape)
-
-            # Initialize combined cost matrix with semantic costs
-            combined_cost_matrix = semantic_cost_matrix.copy()
-
-            for i, track_idx in enumerate(track_indices):
-                if predicted_centroids[i] is None:
-                    continue
-
-                # Find spatially close detections
-                if len(detection_centroids) > 0:
-                    close_detection_indices = detections_tree.query_ball_point(
-                        predicted_centroids[i], self.track_query_eps
-                    )
-
-                    for local_det_idx in close_detection_indices:
-                        j = local_det_idx  # Index in detection_indices
-                        if j >= len(detection_indices):
-                            continue
-
-                        # Skip if semantic cost is already too high (gated out)
-                        # if semantic_cost_matrix[i, j] > self.metric.matching_threshold:
-                        # continue
-
-                        # Compute geometric costs
-                        predicted_shape = predicted_alpha_shapes[i]
-
-                        # IoU cost
-                        iou = self._convex_hull_iou_trimesh(
-                            predicted_shape["mesh"], detections[j].mesh
-                        )
-                        # iou =
-
-                        # ICP cost (simplified - you may want to use your existing ICP function
-                        R, t, _, _, icp_cost = rigid_icp(
-                            predicted_shape["original_points"],
-                            detections[j].original_points,
-                            max_iterations=5,
-                            debug=False,
-                        )
-                        # R, t, icp_cost = icp(predicted_shape['original_points'], detections[j].original_points, max_iterations=5, ret_err=True)
-
-                        # Combine costs: semantic + geometric
-                        geometric_cost = icp_cost + (1.0 - iou)
-
-                        # Weight combination (adjust weights as needed)
-                        semantic_weight = 0.4
-                        geometric_weight = 0.6
-
-                        combined_cost = (
-                            semantic_weight * semantic_cost_matrix[i, j]
-                            + geometric_weight * geometric_cost
-                        )
-
-                        combined_cost_matrix[i, j] = combined_cost
-
-            return combined_cost_matrix
-
-        def geometric_iou_metric(tracks, dets, track_indices, detection_indices):
-            """Pure geometric matching for unconfirmed tracks."""
-            cost_matrix = np.ones((len(track_indices), len(detection_indices)))
-
-            for i, track_idx in enumerate(track_indices):
-                track = tracks[track_idx]
-                # predicted_box = track.to_box()
-                predicted_shape = track.to_shape_dict()
-
-                for j, det_idx in enumerate(detection_indices):
-                    detection = dets[det_idx]
-
-                    # Simple 3D box IoU as fallback
-                    # iou = self._box_iou_3d(predicted_box, detection.box)
-                    iou = self._convex_hull_iou_trimesh(
-                        predicted_shape["mesh"], detection.mesh
-                    )
-                    cost_matrix[i, j] = 1.0 - iou
-
-            return cost_matrix
-
-        def icp_metric(tracks, dets, track_indices, detection_indices):
-            """Pure geometric matching for unconfirmed tracks."""
-            cost_matrix = np.ones((len(track_indices), len(detection_indices)))
-
-            for i, track_idx in enumerate(track_indices):
-                track = tracks[track_idx]
-                # predicted_box = track.to_box()
-                predicted_shape = track.to_shape_dict()
-
-                for j, det_idx in enumerate(detection_indices):
-                    detection = dets[det_idx]
-
-                    # Simple 3D box IoU as fallback
-                    # iou = self._box_iou_3d(predicted_box, detection.box)
-                    R, t, _, _, icp_err = rigid_icp(
-                        predicted_shape["original_points"],
-                        detection.original_points,
-                        max_iterations=5,
-                        debug=False,
-                    )
-
-                    # R, t, icp_err = icp(predicted_shape['original_points'], detection.original_points, max_iterations=5, ret_err=True)
-
-                    cost_matrix[i, j] = icp_err
-
-            return cost_matrix
-
-        # Split track set into confirmed and unconfirmed tracks
-        confirmed_tracks = [i for i, t in enumerate(self.tracks) if t.is_confirmed()]
-        unconfirmed_tracks = [
-            i for i, t in enumerate(self.tracks) if not t.is_confirmed()
-        ]
-
-        # Associate confirmed tracks using enhanced gated metric (semantic + geometric)
-        matches_a, unmatched_tracks_a, unmatched_detections = (
-            linear_assignment.matching_cascade(
-                enhanced_gated_metric,
-                self.metric.matching_threshold,
-                self.max_age,
-                self.tracks,
-                detections,
-                confirmed_tracks,
-            )
-        )
-
-        # Associate remaining tracks with unconfirmed tracks using geometric IoU
-        iou_track_candidates = unconfirmed_tracks + [
-            k for k in unmatched_tracks_a if self.tracks[k].time_since_update == 1
-        ]
-        unmatched_tracks_a = [
-            k for k in unmatched_tracks_a if self.tracks[k].time_since_update != 1
-        ]
-
-        matches_b, unmatched_tracks_b, unmatched_detections = (
-            linear_assignment.min_cost_matching(
-                icp_metric,
-                self.icp_max_dist,
-                self.tracks,
-                detections,
-                iou_track_candidates,
-                unmatched_detections,
-            )
-        )
-
-        matches = matches_a + matches_b
-        unmatched_tracks = list(set(unmatched_tracks_a + unmatched_tracks_b))
-        return matches, unmatched_tracks, unmatched_detections
 
     def _convex_hull_iou_trimesh(
         self, mesh1: trimesh.Trimesh, mesh2: trimesh.Trimesh

@@ -377,7 +377,7 @@ class OWLViTAlphaShapeMFCF:
         self.split = split
 
         self.min_box_iou = 0.1
-        self.lidar_connected_components_eps = 0.5
+        self.lidar_connected_components_eps = 1.0
         self.min_component_points = 10
 
         self.nms_iou_threshold = 0.7
@@ -1266,8 +1266,9 @@ class OWLViTAlphaShapeMFCF:
 
                 track = tracker.tracks[track_id]
 
-                pos = track.mean[:3]
-                radius = np.linalg.norm(track.lwh*0.5)
+                box = track.to_box()
+                pos = box[:3]
+                radius = np.linalg.norm(box[3:6]*0.5)
 
                 lidar_indices = lidar_tree.query_ball_point(pos, radius)
                 lidar_indices = np.array(lidar_indices, int)
@@ -1276,7 +1277,7 @@ class OWLViTAlphaShapeMFCF:
                     continue
 
                 world_points = lidar_tree.data[lidar_indices]
-                world_points = ConvexHullObject.points_in_box(track.to_box(), world_points.copy())
+                world_points = ConvexHullObject.points_in_box(box, world_points.copy())
 
                 if len(world_points) < self.min_component_points:
                     continue
@@ -1319,7 +1320,7 @@ class OWLViTAlphaShapeMFCF:
                 component_3d_points
             )
 
-            obj = ConvexHullObject(
+            full_obj = ConvexHullObject(
                 original_points=component_3d_points_city,
                 confidence=(box_info['objectness_score']+iou_matrix[box_idx, cmp_label])/2.0,
                 iou_2d=iou_matrix[box_idx, cmp_label],
@@ -1329,8 +1330,8 @@ class OWLViTAlphaShapeMFCF:
                 source="vision_guided"
             )
 
-            if obj.original_points is not None:
-                vision_clusters.append(obj)
+            # if obj.original_points is not None:
+            #     vision_clusters.append(obj)
 
             (
                 uv_points,
@@ -1383,14 +1384,14 @@ class OWLViTAlphaShapeMFCF:
                 source="vision_guided"
             )
 
-            if obj.original_points is not None:
+            # if obj.original_points is not None:
+                # vision_clusters.append(obj)
+
+
+            if obj.original_points is not None and in_box_prop < self.nms_iou_threshold:
                 vision_clusters.append(obj)
-
-
-            # if obj.original_points is not None and in_box_prop < self.nms_iou_threshold:
-            #     vision_clusters.append(obj)
-            # elif full_obj.original_points is not None:
-            #     vision_clusters.append(full_obj)
+            elif full_obj.original_points is not None:
+                vision_clusters.append(full_obj)
 
         # find non assigned clusters
         non_assigned_clusters = set(cmp_lbl for cmp_lbl in range(lidar_n_components)).difference(clusters_assigned_set)
@@ -1932,6 +1933,8 @@ class OWLViTAlphaShapeMFCF:
                 ax.add_patch(obj_polygon)
 
             for track in tracks:
+                if track.is_deleted():
+                    continue
                 box = track.to_box()
                 # box = track.last_box
                 center_xy = box[:2]
@@ -1943,17 +1946,18 @@ class OWLViTAlphaShapeMFCF:
                 corners = get_rotated_box(center_xy, length, width, yaw)
 
                 color = "yellow"
-                alpha = 0.3
+                alpha = 0.5
                 if track.is_confirmed():
                     color = "green"
                     alpha = 0.7
                 elif track.is_deleted():
-                    color = "red"
+                    color = "grey"
+                    alpha = 0.1
 
                 track_polygon = patches.Polygon(
                     corners,
                     linewidth=2,
-                    edgecolor=color,
+                    edgecolor="brown",
                     facecolor="none",
                     alpha=alpha,
                     linestyle="-",
@@ -1961,9 +1965,6 @@ class OWLViTAlphaShapeMFCF:
                 ax.add_patch(track_polygon)
 
                 if track.optimized_boxes is not None:
-                    box = track.optimized_boxes[-1]
-
-
                     for box in track.optimized_boxes:
                         center_xy = box[:2]
                         length = box[3]
@@ -1983,7 +1984,7 @@ class OWLViTAlphaShapeMFCF:
                         ax.add_patch(track_polygon)
 
                 if track.is_confirmed():
-                    # next_timestamp_ns = timestamp_ns + 1e+8
+                    next_timestamp_ns = timestamp_ns + 1e+8
                     
                     boxes = track.extrapolate_box(all_timestamps)
                     for box in boxes:
@@ -1997,7 +1998,7 @@ class OWLViTAlphaShapeMFCF:
                         track_polygon = patches.Polygon(
                             corners,
                             linewidth=1,
-                            edgecolor="orange",
+                            edgecolor="purple",
                             facecolor="none",
                             alpha=1.0,
                             linestyle="--",
@@ -2090,178 +2091,178 @@ class OWLViTAlphaShapeMFCF:
             plt.savefig(save_path, dpi=300, bbox_inches="tight")
             plt.close()
 
-            image = np.zeros((2000, 2000, 3), dtype=np.uint8)
-            new_image = image.copy()
-            text_size = int(image.shape[1] / 1000)
-            text_pixel = int(image.shape[1]/400)
-            max_shape = max(image.shape)
-            previous_label_boxes = []
-            text_infos = []
+            # image = np.zeros((2000, 2000, 3), dtype=np.uint8)
+            # new_image = image.copy()
+            # text_size = int(image.shape[1] / 1000)
+            # text_pixel = int(image.shape[1]/400)
+            # max_shape = max(image.shape)
+            # previous_label_boxes = []
+            # text_infos = []
 
-            color_map = {
-                "yellow": (0, 255, 255),
-                "green": (0, 255, 0), 
-                "red": (0, 0, 255)
-            }
+            # color_map = {
+            #     "yellow": (0, 255, 255),
+            #     "green": (0, 255, 0), 
+            #     "red": (0, 0, 255)
+            # }
 
-            # Define world coordinate bounds (-50 to +50 meters relative to ego)
-            world_x_min, world_x_max = ego_pos[0] - 50, ego_pos[0] + 50
-            world_y_min, world_y_max = ego_pos[1] - 50, ego_pos[1] + 50
+            # # Define world coordinate bounds (-50 to +50 meters relative to ego)
+            # world_x_min, world_x_max = ego_pos[0] - 50, ego_pos[0] + 50
+            # world_y_min, world_y_max = ego_pos[1] - 50, ego_pos[1] + 50
 
-            print("world_x_range", (world_x_min, world_x_max))
-            print("world_y_range", (world_y_min, world_y_max))
+            # print("world_x_range", (world_x_min, world_x_max))
+            # print("world_y_range", (world_y_min, world_y_max))
 
-            def to_image_coords(points):
-                """Convert world coordinates to image pixel coordinates"""
-                # Handle both single point [x, y] and multiple points [[x1, y1], [x2, y2], ...]
-                points = np.array(points)
-                if points.ndim == 1:
-                    points = points.reshape(1, -1)
+            # def to_image_coords(points):
+            #     """Convert world coordinates to image pixel coordinates"""
+            #     # Handle both single point [x, y] and multiple points [[x1, y1], [x2, y2], ...]
+            #     points = np.array(points)
+            #     if points.ndim == 1:
+            #         points = points.reshape(1, -1)
                 
-                # Extract x, y coordinates
-                x_world = points[:, 0]
-                y_world = points[:, 1]
+            #     # Extract x, y coordinates
+            #     x_world = points[:, 0]
+            #     y_world = points[:, 1]
                 
-                # Normalize to [0, 1] range
-                x_norm = (x_world - world_x_min) / (world_x_max - world_x_min)
-                y_norm = (y_world - world_y_min) / (world_y_max - world_y_min)
+            #     # Normalize to [0, 1] range
+            #     x_norm = (x_world - world_x_min) / (world_x_max - world_x_min)
+            #     y_norm = (y_world - world_y_min) / (world_y_max - world_y_min)
                 
-                # Convert to pixel coordinates
-                # Note: cv2 coordinate system has (0,0) at top-left
-                # x increases rightward (same as world)
-                # y increases downward (opposite of typical world coordinates)
-                x_pixel = x_norm * 2000
-                y_pixel = (1 - y_norm) * 2000  # Flip y-axis for cv2
+            #     # Convert to pixel coordinates
+            #     # Note: cv2 coordinate system has (0,0) at top-left
+            #     # x increases rightward (same as world)
+            #     # y increases downward (opposite of typical world coordinates)
+            #     x_pixel = x_norm * 2000
+            #     y_pixel = (1 - y_norm) * 2000  # Flip y-axis for cv2
                 
-                # Convert to integers and clip to image bounds
-                x_pixel = np.clip(x_pixel, 0, 1999).astype(np.int32)
-                y_pixel = np.clip(y_pixel, 0, 1999).astype(np.int32)
+            #     # Convert to integers and clip to image bounds
+            #     x_pixel = np.clip(x_pixel, 0, 1999).astype(np.int32)
+            #     y_pixel = np.clip(y_pixel, 0, 1999).astype(np.int32)
                 
-                # Return as integer coordinates
-                coords = np.column_stack([x_pixel, y_pixel])
+            #     # Return as integer coordinates
+            #     coords = np.column_stack([x_pixel, y_pixel])
                 
-                # If input was single point, return single point
-                if coords.shape[0] == 1:
-                    return tuple(coords[0])
-                else:
-                    return coords
+            #     # If input was single point, return single point
+            #     if coords.shape[0] == 1:
+            #         return tuple(coords[0])
+            #     else:
+            #         return coords
 
 
 
-            for track in tracks:
-                box = track.to_box()
-                center_xy = box[:2]
-                length = box[3]
-                width = box[4]
-                yaw = box[6]
+            # for track in tracks:
+            #     box = track.to_box()
+            #     center_xy = box[:2]
+            #     length = box[3]
+            #     width = box[4]
+            #     yaw = box[6]
 
-                # Get rotated box corners
-                corners = get_rotated_box(center_xy, length, width, yaw)
+            #     # Get rotated box corners
+            #     corners = get_rotated_box(center_xy, length, width, yaw)
                 
-                color_name = "yellow"
-                alpha = 0.3
-                if track.is_confirmed():
-                    color_name = "green"
-                    alpha = 0.7
-                elif track.is_deleted():
-                    color_name = "red"
+            #     color_name = "yellow"
+            #     alpha = 0.3
+            #     if track.is_confirmed():
+            #         color_name = "green"
+            #         alpha = 0.7
+            #     elif track.is_deleted():
+            #         color_name = "red"
 
-                color_bgr = color_map[color_name]
+            #     color_bgr = color_map[color_name]
                 
-                # Convert corners to integer pixel coordinates
-                corners = to_image_coords(corners)
-                corners_int = np.array(corners, dtype=np.int32)
+            #     # Convert corners to integer pixel coordinates
+            #     corners = to_image_coords(corners)
+            #     corners_int = np.array(corners, dtype=np.int32)
 
-                dist = np.linalg.norm(center_xy[:2]-ego_pos[:2])
-                # print(f"x, y = {x}, {y}")
+            #     dist = np.linalg.norm(center_xy[:2]-ego_pos[:2])
+            #     # print(f"x, y = {x}, {y}")
                 
-                if dist >= 50:
-                    continue
+            #     if dist >= 50:
+            #         continue
 
 
-                x, y = to_image_coords(center_xy)
+            #     x, y = to_image_coords(center_xy)
 
-                # Create overlay for alpha blending
-                overlay = image.copy()
+            #     # Create overlay for alpha blending
+            #     overlay = image.copy()
                 
-                # Draw solid polygon outline
-                cv2.polylines(overlay, [corners_int], isClosed=True, color=color_bgr, thickness=2)
+            #     # Draw solid polygon outline
+            #     cv2.polylines(overlay, [corners_int], isClosed=True, color=color_bgr, thickness=2)
                 
-                # Blend with original image for alpha effect
-                cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+            #     # Blend with original image for alpha effect
+            #     cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
 
-                continue
+            #     continue
 
-                s= f"id:{track.track_id} age:{track.age} hits:{track.hits} iou:{track.last_iou}"
+            #     s= f"id:{track.track_id} age:{track.age} hits:{track.hits} iou:{track.last_iou}"
 
-                (label_width, label_height), baseline = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, text_size, text_pixel)
-                original_top_left = (int(x), int(y) - label_height - baseline*2)
-                top_left = original_top_left
+            #     (label_width, label_height), baseline = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, text_size, text_pixel)
+            #     original_top_left = (int(x), int(y) - label_height - baseline*2)
+            #     top_left = original_top_left
 
-                # clip the top left so that the label is not off the image
-                top_left = (np.clip(top_left[0], 0, max_shape - label_width), np.clip(top_left[1], 0, max_shape - label_height - baseline))
+            #     # clip the top left so that the label is not off the image
+            #     top_left = (np.clip(top_left[0], 0, max_shape - label_width), np.clip(top_left[1], 0, max_shape - label_height - baseline))
 
-                # base the bottom right on the new top_left
-                bottom_right = (top_left[0] + label_width, top_left[1] + label_height + baseline*2)
-                curr_box = np.array([top_left[0], top_left[1], bottom_right[0], bottom_right[1]])
+            #     # base the bottom right on the new top_left
+            #     bottom_right = (top_left[0] + label_width, top_left[1] + label_height + baseline*2)
+            #     curr_box = np.array([top_left[0], top_left[1], bottom_right[0], bottom_right[1]])
 
-                # check if the current label overlaps with another, then move it by it's height
-                for prev_box in previous_label_boxes:
-                    if box_iou(curr_box[None, :], prev_box[None, :]) > 0.1:
-                        curr_box[[1, 3]] += label_height + baseline * 2
+            #     # check if the current label overlaps with another, then move it by it's height
+            #     for prev_box in previous_label_boxes:
+            #         if box_iou(curr_box[None, :], prev_box[None, :]) > 0.1:
+            #             curr_box[[1, 3]] += label_height + baseline * 2
 
-                previous_label_boxes.append(curr_box)
-                top_left, bottom_right = curr_box[0:2], curr_box[2:]
+            #     previous_label_boxes.append(curr_box)
+            #     top_left, bottom_right = curr_box[0:2], curr_box[2:]
 
-                # Draw arrow if text was moved significantly from original position
-                original_center = (int(x), int(y))
-                final_text_center = (int(top_left[0] + label_width // 2), int(top_left[1] + label_height // 2))
-                distance_moved = np.sqrt((final_text_center[0] - original_center[0])**2 + 
-                                        (final_text_center[1] - original_center[1])**2)
+            #     # Draw arrow if text was moved significantly from original position
+            #     original_center = (int(x), int(y))
+            #     final_text_center = (int(top_left[0] + label_width // 2), int(top_left[1] + label_height // 2))
+            #     distance_moved = np.sqrt((final_text_center[0] - original_center[0])**2 + 
+            #                             (final_text_center[1] - original_center[1])**2)
 
-                # Draw arrow if moved more than threshold (e.g., 10 pixels)
-                if distance_moved > 10:
-                    # Draw arrow from final text position to original position
-                    arrow_color = (128, 128, 128)  # Gray color for arrow
-                    arrow_thickness = 1
+            #     # Draw arrow if moved more than threshold (e.g., 10 pixels)
+            #     if distance_moved > 10:
+            #         # Draw arrow from final text position to original position
+            #         arrow_color = (128, 128, 128)  # Gray color for arrow
+            #         arrow_thickness = 1
                     
-                    # Calculate arrow start point (edge of text box closest to original position)
-                    dx = original_center[0] - final_text_center[0]
-                    dy = original_center[1] - final_text_center[1]
+            #         # Calculate arrow start point (edge of text box closest to original position)
+            #         dx = original_center[0] - final_text_center[0]
+            #         dy = original_center[1] - final_text_center[1]
                     
-                    # Normalize direction and scale to text box edge
-                    if abs(dx) > abs(dy):
-                        # Arrow starts from left/right edge of text
-                        arrow_start_x = int(top_left[0] if dx > 0 else bottom_right[0])
-                        arrow_start_y = final_text_center[1]
-                    else:
-                        # Arrow starts from top/bottom edge of text
-                        arrow_start_x = final_text_center[0]
-                        arrow_start_y = int(top_left[1] if dy > 0 else bottom_right[1])
+            #         # Normalize direction and scale to text box edge
+            #         if abs(dx) > abs(dy):
+            #             # Arrow starts from left/right edge of text
+            #             arrow_start_x = int(top_left[0] if dx > 0 else bottom_right[0])
+            #             arrow_start_y = final_text_center[1]
+            #         else:
+            #             # Arrow starts from top/bottom edge of text
+            #             arrow_start_x = final_text_center[0]
+            #             arrow_start_y = int(top_left[1] if dy > 0 else bottom_right[1])
                     
-                    arrow_start = (arrow_start_x, arrow_start_y)
+            #         arrow_start = (arrow_start_x, arrow_start_y)
                     
-                    # Draw the arrow line
-                    cv2.arrowedLine(image, arrow_start, original_center, 
-                                    arrow_color, arrow_thickness, tipLength=0.3)
+            #         # Draw the arrow line
+            #         cv2.arrowedLine(image, arrow_start, original_center, 
+            #                         arrow_color, arrow_thickness, tipLength=0.3)
 
-                # Draw the label background rectangle
-                new_image = cv2.rectangle(
-                    new_image, tuple(int(x) for x in top_left), tuple(int(x) for x in bottom_right), color_bgr, -1)
+            #     # Draw the label background rectangle
+            #     new_image = cv2.rectangle(
+            #         new_image, tuple(int(x) for x in top_left), tuple(int(x) for x in bottom_right), color_bgr, -1)
 
-                # Add text info for later rendering
-                text_infos.append([s, (int(top_left[0]), int(top_left[1]) + baseline + label_height), 
-                                cv2.FONT_HERSHEY_SIMPLEX, text_size, color_bgr, text_pixel, cv2.LINE_AA])
+            #     # Add text info for later rendering
+            #     text_infos.append([s, (int(top_left[0]), int(top_left[1]) + baseline + label_height), 
+            #                     cv2.FONT_HERSHEY_SIMPLEX, text_size, color_bgr, text_pixel, cv2.LINE_AA])
 
-            image = cv2.addWeighted(new_image, alpha, image, 1 - alpha, 0)
+            # image = cv2.addWeighted(new_image, alpha, image, 1 - alpha, 0)
 
-            for text_info in text_infos:
-                print("text_info", text_info)
-                cv2.putText(
-                    image, *text_info
-                )
+            # for text_info in text_infos:
+            #     print("text_info", text_info)
+            #     cv2.putText(
+            #         image, *text_info
+            #     )
 
-            cv2.imwrite(str(save_folder / f"frame_{i}_cv.png"), image)
+            # cv2.imwrite(str(save_folder / f"frame_{i}_cv.png"), image)
 
 
             #################################################################

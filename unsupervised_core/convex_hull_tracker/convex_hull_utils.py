@@ -245,10 +245,18 @@ def relative_object_pose(
         # distances, indices = tree.query(A)
         A_indices, B_indices, distances = matching_func(A, B)
 
+        # print("distances", distances.shape, distances.min(), distances.max(), np.median(distances))
+
+        # distance_threshold = np.median(distances)
+        # distance_mask = distances <= distance_threshold
+        # A_indices = A_indices[distance_mask]
+        # B_indices = B_indices[distance_mask]
+        # distances = distances[distance_mask]
+
         A_, B_ = A[A_indices], B[B_indices]
 
         # Modified analytical_y_rotation for centered points
-        R, t = analytical_y_rotation_centered(A_, B_)
+        R, t = analytical_z_rotation_centered(A_, B_)
 
         # Update transformation matrix
         T_iter = np.eye(4)
@@ -292,6 +300,7 @@ def relative_object_pose(
         )
 
     final_err = distances.mean()
+    # final_err = np.median(distances)
 
     return R_final, t_final, A_indices, B_indices, final_err
 
@@ -320,6 +329,30 @@ def analytical_y_rotation_centered(
     R = np.array([[cos_theta, 0, sin_theta], [0, 1, 0], [-sin_theta, 0, cos_theta]])
 
     # For centered points, translation is just the difference after rotation
+    A_rotated = (R @ A.T).T
+    t = np.mean(B - A_rotated, axis=0)
+
+    return R, t
+
+def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Z-axis rotation for already-centered points (yaw only)."""
+    
+    # Extract x and y coordinates for z-axis rotation
+    Ax, Ay = A[:, 0], A[:, 1]  # X,Y → Z-axis rotation (yaw)
+    Bx, By = B[:, 0], B[:, 1]
+
+    # Analytical solution for optimal theta
+    numerator = np.sum(Bx * Ay - By * Ax)
+    denominator = np.sum(Bx * Ax + By * Ay)
+    theta = np.arctan2(numerator, denominator)
+
+    # Z-axis rotation matrix
+    cos_theta, sin_theta = np.cos(theta), np.sin(theta)
+    R = np.array([[cos_theta, -sin_theta, 0], 
+                  [sin_theta,  cos_theta, 0], 
+                  [0,          0,         1]])
+
+    # Translation after rotation
     A_rotated = (R @ A.T).T
     t = np.mean(B - A_rotated, axis=0)
 
@@ -358,7 +391,7 @@ def relative_object_rotation(
         distances, indices = tree.query(A)
 
         # Modified analytical_y_rotation for centered points
-        R, _ = analytical_y_rotation_centered(A, B[indices])
+        R, _ = analytical_z_rotation_centered(A, B[indices])
 
         # Update transformation matrix
         R_final = R @ R_final
