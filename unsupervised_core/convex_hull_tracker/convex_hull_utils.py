@@ -337,8 +337,12 @@ def analytical_y_rotation_centered(
 def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Z-axis rotation for already-centered points (yaw only)."""
     
+    t = np.mean(B - A, axis=0)
+
+    A_translated = A + t
+
     # Extract x and y coordinates for z-axis rotation
-    Ax, Ay = A[:, 0], A[:, 1]  # X,Y → Z-axis rotation (yaw)
+    Ax, Ay = A_translated[:, 0], A_translated[:, 1]  # X,Y → Z-axis rotation (yaw)
     Bx, By = B[:, 0], B[:, 1]
 
     # Analytical solution for optimal theta
@@ -352,9 +356,9 @@ def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.nda
                   [sin_theta,  cos_theta, 0], 
                   [0,          0,         1]])
 
-    # Translation after rotation
-    A_rotated = (R @ A.T).T
-    t = np.mean(B - A_rotated, axis=0)
+    # # Translation after rotation
+    # A_rotated = (R @ A.T).T
+    # t = np.mean(B - A_rotated, axis=0)
 
     return R, t
 

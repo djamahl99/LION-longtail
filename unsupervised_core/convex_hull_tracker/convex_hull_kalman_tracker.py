@@ -96,13 +96,13 @@ class ConvexHullKalmanTracker:
         self.max_iou_distance = 0.9
 
         self.min_semantic_threshold = 0.9
-        self.min_iou_threshold = 0.3
+        self.min_iou_threshold = 0.1
         self.min_box_iou = 0.1
 
         self.icp_max_dist = 1.0
-        self.icp_max_iterations = 10
+        self.icp_max_iterations = 5
 
-        self.nms_iou_threshold = 0.7
+        self.nms_iou_threshold = 0.1
         self.nms_semantic_threshold: float = 0.9
         self.nms_query_distance: float = 5.0
         self.n_points_err_thresh = 0.3
