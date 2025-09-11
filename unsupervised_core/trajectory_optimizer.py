@@ -11,6 +11,110 @@ from .box_utils import compute_ppscore, icp
 
 
 def optimize_with_gtsam_timed(initial_poses, constraints, timestamps_ns):
+    n_poses = len(initial_poses)
+    timestamps = np.array(timestamps_ns) * 1e-9
+    
+    graph = gtsam.NonlinearFactorGraph()
+    initial_estimate = gtsam.Values()
+    
+    # 1. Better prior - fix only first pose with small uncertainty
+    prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+        np.array([0.0, 0.0, 0.0,  # reasonable rotation uncertainty (rad)
+                  1.0, 1.0, 1.0])  # Small translation uncertainty (m)
+    )
+    graph.add(gtsam.PriorFactorPose3(0, gtsam.Pose3(initial_poses[0]), prior_noise))
+    
+    # 2. Add initial estimates
+    for i, pose_matrix in enumerate(initial_poses):
+        initial_estimate.insert(i, gtsam.Pose3(pose_matrix))
+    
+    # 3. Add constraints with confidence-based noise
+    for constraint in constraints:
+        i, j = constraint['frame_i'], constraint['frame_j']
+        relative_pose = gtsam.Pose3(constraint['relative_pose'])
+        confidence = constraint['confidence']
+        is_loop = constraint.get('is_loop', False)
+        
+        # Time-based uncertainty
+        dt = abs(timestamps[j] - timestamps[i])
+        
+        # if is_loop:
+        #     # Loop closures: tighter constraints if confident
+        #     base_rot = 0.05 / (confidence + 0.1)
+        #     base_trans = 0.1 / (confidence + 0.1)
+        # else:
+        #     # Sequential: scale with time gap
+        #     time_factor = 1.0 + dt * 0.01  # Gradual increase
+        #     base_rot = 0.1 * time_factor / (confidence + 0.1)
+        #     base_trans = 0.2 * time_factor / (confidence + 0.1)
+        
+        # Z-rotation only constraint (vehicles don't pitch/roll)
+        noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([10.0, 10.0, 10.0,  # Large X,Y rotation uncertainty
+                     3.0, 3.0, 3.0])
+        )
+        
+        # Add robust loss for outlier rejection
+        robust_noise = gtsam.noiseModel.Robust.Create(
+            gtsam.noiseModel.mEstimator.Huber.Create(1.345),
+            noise
+        )
+        
+        graph.add(gtsam.BetweenFactorPose3(i, j, relative_pose, robust_noise))
+    
+    # 4. Add velocity smoothness for consecutive poses
+    if n_poses > 2:
+        for i in range(1, n_poses - 1):
+            dt_prev = timestamps[i] - timestamps[i-1]
+            dt_next = timestamps[i+1] - timestamps[i]
+            
+            # Constant velocity prior
+            vel_noise = gtsam.noiseModel.Diagonal.Sigmas(
+                np.array([1.0, 1.0, 0.01,  # Tight on Z rotation
+                         0.5, 0.5, 0.5])    # Moderate on translation
+            )
+            
+            # Expected pose based on constant velocity
+            T_prev = initial_poses[i-1]
+            T_curr = initial_poses[i]
+            T_next = initial_poses[i+1]
+            
+            # Velocity from i-1 to i
+            vel_pose = np.linalg.inv(T_prev) @ T_curr
+            
+            # Predicted next pose
+            dt_ratio = dt_next / dt_prev
+            predicted_delta = np.eye(4)
+            predicted_delta[:3, 3] = vel_pose[:3, 3] * dt_ratio
+            # Handle rotation interpolation for Z-axis only
+            
+            predicted_pose = gtsam.Pose3(T_curr @ predicted_delta)
+            
+            graph.add(gtsam.PriorFactorPose3(i+1, predicted_pose, vel_noise))
+    
+    # 5. Optimize with better parameters
+    params = gtsam.LevenbergMarquardtParams()
+    params.setRelativeErrorTol(1e-6)
+    params.setAbsoluteErrorTol(1e-6)
+    params.setMaxIterations(200)
+    
+    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_estimate, params)
+    result = optimizer.optimize()
+    
+    # Extract results
+    optimized_poses = [result.atPose3(i).matrix() for i in range(n_poses)]
+    marginals = gtsam.Marginals(graph, result)
+    
+    quality = {
+        'initial_error': graph.error(initial_estimate),
+        'final_error': graph.error(result),
+        'iterations': optimizer.iterations(),
+        'error_reduction': 1 - graph.error(result) / graph.error(initial_estimate)
+    }
+    
+    return optimized_poses, marginals, quality
+
+def optimize_with_gtsam_timed_(initial_poses, constraints, timestamps_ns):
     """
     Optimize 3D pose graph with temporal information using GTSAM
     

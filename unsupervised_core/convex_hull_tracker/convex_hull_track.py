@@ -14,10 +14,15 @@ from lion.unsupervised_core.convex_hull_tracker.convex_hull_object import (
     ConvexHullObject,
 )
 from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
+    analytical_z_rotation_centered,
+    hungarian_matching,
+    icp_hungarian,
     relative_object_pose,
+    relative_object_pose_multiresolution,
     relative_object_rotation,
     rigid_icp,
     voxel_sampling_fast,
+    yaw_circular_mean,
 )
 from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import (
     PoseKalmanFilter,
@@ -91,6 +96,7 @@ class ConvexHullTrack:
         self.positions.append(mean[:3])
 
         # final after global optimization
+        self.initial_poses = None
         self.optimized_poses = None
         self.optimized_boxes = None
         self.prev_pose = PoseKalmanFilter.pose_vector_to_transform(mean[:4])
@@ -108,6 +114,8 @@ class ConvexHullTrack:
         self._constraint_cache = {}
         self._cached_initial_poses = []
         self._last_processed_frame = 0
+
+        self.icp_cache = {}
 
     def extrapolate_box(self, timestamps):
         init_timestamp_sec = min(self.timestamps) * NANOSEC_TO_SEC
@@ -133,6 +141,7 @@ class ConvexHullTrack:
     #     return new_prediction.reshape(7)
 
     def to_box(self):
+        # return self.optimized_boxes[-1] # last seen box...
         return self.extrapolate_box([self.last_predict_timestamp])[0]
 
     # def to_box(self):
@@ -224,166 +233,244 @@ class ConvexHullTrack:
 
         self.positions.append(pos)
 
+    def get_or_compute_relative_pose(self, points_i, points_j, center, cache_key):
+        if cache_key in self.icp_cache:
+            R_cached, t_cached, cost, center_old = self.icp_cache[cache_key]
+            # Transform translation for new center
+            delta = center_old - center
+            t_new = t_cached + (np.eye(3) - R_cached) @ delta
+            return R_cached, t_new, cost
+        
+        # Compute and cache
+        centered_i = points_i - center
+        centered_j = points_j - center
+        R, t, inliers, _, cost = relative_object_pose(centered_i, centered_j)
+        self.icp_cache[cache_key] = (R, t, cost, center.copy())
+        return R, t, cost
 
     def compute_poses(self):
+
         timestamps = self.timestamps
         n_frames = len(timestamps)
 
-        world_points_per_timestamp = []
-        
-        # Collect world points and centres
+        points_list = []
+        boxes = self.extrapolate_box(timestamps)
+        initial_poses = []
+
+        # use initial pose as reference
+        ref_pose_vector = PoseKalmanFilter.box_to_pose_vector(boxes[0])
+        ref_pose_matrix = PoseKalmanFilter.pose_vector_to_transform(ref_pose_vector)
+        world_to_object = np.linalg.inv(ref_pose_matrix)
+
+        last_position = ref_pose_vector[:3].copy()
+        initial_position = ref_pose_vector[:3].copy()
+        last_yaw = ref_pose_vector[3].copy()
+        initial_yaw = ref_pose_vector[3].copy()
+        last_velocity = np.zeros(3)
+        last_angular_velocity = 0
+
+        # Collect world points and centers
         for i, timestamp_ns in enumerate(timestamps):
             obj: ConvexHullObject = self.history[i]
             world_points = obj.original_points
-            world_points_per_timestamp.append(world_points.copy())
 
-        pred_boxes = self.extrapolate_box(timestamps)
-        world_centres = pred_boxes[:, :3]
+            # add our pose here
+            pose_vector = PoseKalmanFilter.box_to_pose_vector(boxes[i])
+            pose_matrix = PoseKalmanFilter.pose_vector_to_transform(pose_vector)
+            initial_poses.append(pose_matrix)
 
-        initial_poses = []
-        for box in pred_boxes:
-            pose_vector = PoseKalmanFilter.box_to_pose_vector(box)
-            pose = PoseKalmanFilter.pose_vector_to_transform(pose_vector)
-            initial_poses.append(pose)
+            # object_points = points_rigid_transform(world_points, world_to_object)
 
-        start_frame = max(1, self._last_processed_frame)
-        # start_frame = 1
-        constraints = [self._constraint_cache[key] for key in sorted(self._constraint_cache.keys())]
-        
-        self._constraint_cache = {}
+            points_list.append(world_points)
 
-        for i in range(start_frame, n_frames):
-            constraint_key = (i-1, i)  # Key for frame pair
+        optimized_poses = [ref_pose_matrix]
 
-            prev_pose = initial_poses[i-1]
-            cur_pose = initial_poses[i]
-            undo_pose = np.linalg.inv(prev_pose)
+        last_optimized_yaw = np.copy(last_yaw)
+        last_optimized_position = np.copy(last_position)
 
-            prev_points = points_rigid_transform(
-                world_points_per_timestamp[i - 1], undo_pose
+        constraints = []
+        for i in range(1, n_frames):
+            expected_pose = initial_poses[i]
+            expected_yaw = Rotation.from_matrix(expected_pose[:3, :3]).as_rotvec()[2]
+            expected_position = expected_pose[:3, 3]
+
+            # rel_R, rel_pos, A_inliers, B_inliers, icp_cost_rel = relative_object_pose(centered_ref, centered_curr1)
+            R_rel, t_rel, icp_cost_rel = self.get_or_compute_relative_pose(
+                points_list[i-1], points_list[i], 
+                last_optimized_position,
+                (i-1, i, 'relative')
             )
-            cur_points = points_rigid_transform(
-                world_points_per_timestamp[i], undo_pose
-            )
+    
+            rel_yaw = Rotation.from_matrix(R_rel).as_rotvec()[2]
+            rel_yaw_guess = wrap_angle(last_optimized_yaw + rel_yaw)
 
-            prev_yaw = Rotation.from_matrix(prev_pose[:3, :3]).as_rotvec()[2]
-            prev_pose_pos = prev_pose[:3, 3]
+            if i == 1:
+                R_init, t_init, icp_cost_initial = R_rel, t_rel, icp_cost_rel
+            else:
+                R_init, t_init, icp_cost_initial = self.get_or_compute_relative_pose(
+                    points_list[0], points_list[i], 
+                    initial_position,
+                    (0, i, 'initial')
+                )
 
-            cur_yaw = Rotation.from_matrix(cur_pose[:3, :3]).as_rotvec()[2]
-            cur_pose_pos = cur_pose[:3, 3]
+            initial_yaw_guess = wrap_angle(initial_yaw + Rotation.from_matrix(R_init).as_rotvec()[2])
+            expected_initial_offset = expected_position - initial_position
 
-            print("prev_yaw, prev_pose_pos", prev_yaw, prev_pose_pos)
-            print("cur_yaw, cur_pose_pos", cur_yaw, cur_pose_pos)
+            # pose guesses
+            rel_pos_guess = last_position + t_rel
+            initial_pos_guess = initial_position + t_init
 
-            rel_yaw = cur_yaw - prev_yaw
-            rel_position = cur_pose_pos - prev_pose_pos
+            # Compute current velocities
+            dt = (timestamps[i] - timestamps[i-1]) * 1e-9
+            velocity_rel = (rel_pos_guess - last_optimized_position) / dt
+            velocity_init = (initial_pos_guess - last_optimized_position) / dt
+            angular_vel_rel = (rel_yaw_guess - last_optimized_yaw) / dt
+            angular_vel_init = (initial_yaw_guess - last_optimized_yaw) / dt
 
-            print("rel_yaw, rel_position", rel_yaw, rel_position)
+            # Smoothness penalties
+            lambda_smooth = 0.1  # Tunable parameter
+            smooth_cost_rel = lambda_smooth * np.linalg.norm(velocity_rel - last_velocity)**2 #+ lambda_smooth * np.abs(angular_vel_rel - last_angular_velocity)
+            smooth_cost_init = lambda_smooth * np.linalg.norm(velocity_init - last_velocity)**2 #+ lambda_smooth * np.abs(angular_vel_init - last_angular_velocity)
 
-            R, t, A_inliers, B_inliers, icp_cost = relative_object_pose(prev_points, cur_points, max_iterations=self.icp_max_iterations)
+            # weight between the two
+            total_cost_rel = icp_cost_rel + smooth_cost_rel
+            total_cost_init = icp_cost_initial + smooth_cost_init
+            weight_rel = 1.0 / (total_cost_rel + 1e-6)
+            weight_initial = 1.0 / (total_cost_init + 1e-6)
+            total_weight = weight_rel + weight_initial
+            weight_rel /= total_weight
+            weight_initial /= total_weight
 
-            rel_yaw = Rotation.from_matrix(R).as_rotvec()[2]
-            print("relative_object_pose rel_yaw", rel_yaw)
-            print("t", t)
+            # assert weight_rel + weight_initial == 1.0, f"weight_rel + weight_initial = {weight_rel + weight_initial}"
 
-            relative_pose = np.eye(4)
-            relative_pose[:3, :3] = R
-            relative_pose[:3, 3] = t
-            confidence = len(A_inliers) / len(cur_points)
 
-            constraint = {
-                'frame_i': i - 1,
-                'frame_j': i, 
-                'relative_pose': relative_pose,
-                'confidence': confidence,
-            }
-            self._constraint_cache[constraint_key] = constraint
-            self._last_processed_frame = i
-            constraints.append(constraint)
+            optimized_position = rel_pos_guess * weight_rel + initial_pos_guess * weight_initial
+            # optimized_yaw = wrap_angle(rel_yaw_guess * weight_rel + initial_yaw_guess * weight_initial)
+            # Circular mean for angles
+            mean_x = weight_rel * np.cos(rel_yaw_guess) + weight_initial * np.cos(initial_yaw_guess)
+            mean_y = weight_rel * np.sin(rel_yaw_guess) + weight_initial * np.sin(initial_yaw_guess)
+            optimized_yaw = np.arctan2(mean_y, mean_x)
 
-        optimized_poses, marginals, quality = optimize_with_gtsam_timed(
-            initial_poses, constraints, timestamps
-        )
-            
+            print(f"{expected_yaw=:.2f} {initial_yaw_guess=:.2f} {rel_yaw_guess=:.2f}")
+            print(f"{expected_position=} {rel_pos_guess=} {initial_pos_guess=}")
+            print(f"{velocity_rel=} {velocity_init=}")
+            print(f"{angular_vel_rel=} {angular_vel_init=}")
+            print(f"{smooth_cost_rel=} {smooth_cost_init=}")
+
+            last_yaw = expected_yaw
+            last_position = expected_position
+
+            pose = np.eye(4)
+            pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, optimized_yaw], float)).as_matrix()
+            pose[:3, 3] = optimized_position
+            optimized_poses.append(pose)
+
+            # Update for next iteration
+            last_velocity = (optimized_position - last_optimized_position) / dt
+            last_angular_velocity = (optimized_yaw - last_optimized_yaw) / dt
+
+            last_optimized_position = np.copy(optimized_position)
+            last_optimized_yaw = np.copy(optimized_yaw)
+
+        optimized_pose_vectors = np.stack([PoseKalmanFilter.transform_to_pose_vector(x) for x in optimized_poses], axis=0)
+        initial_pose_vectors = np.stack([PoseKalmanFilter.transform_to_pose_vector(x) for x in initial_poses], axis=0)
+
+        print("optimized - initial", optimized_pose_vectors - initial_pose_vectors)
+
+        dists = np.linalg.norm((optimized_pose_vectors[:, :3] - initial_pose_vectors[:, :3]), axis=1)
+        mean_dist = np.mean(dists)
+
+        assert mean_dist < 5.0
+
+        l, w, h = self.c[3:6]
+        self.optimized_poses = optimized_poses
+
+        optimized_boxes = []
+        for i in range(n_frames):
+            yaw = Rotation.from_matrix(optimized_poses[i][:3, :3]).as_rotvec()[2]
+
+            x, y, z = optimized_poses[i][:3, 3]
+
+            box = np.array([x, y, z, l, w, h, yaw])
+            optimized_boxes.append(box)
+
+        self.optimized_boxes = optimized_boxes
+
+
+
         # update points
         # Now transform points to object-centric coordinates
         object_centric_points = []
-        for i, (convex_hull_obj, obj_pose) in enumerate(zip(self.history, optimized_poses)):
+        l, w, h = self.c[3:6]
+
+        for convex_hull_obj, obj_pose in zip(self.history, optimized_poses):
             # Get world points
             world_points = convex_hull_obj.original_points
 
             # Transform to object-centric: multiply by inverse of object pose
             world_to_object = np.linalg.inv(obj_pose)
             object_points = points_rigid_transform(world_points, world_to_object)
+
+            object_points_mask = (np.abs(object_points[:, 0]) < l/2) & (np.abs(object_points[:, 1]) < w/2) & (np.abs(object_points[:, 2]) < h/2)
+            obj_prop = object_points_mask.sum() / object_points_mask.size
+            object_points = object_points[object_points_mask]
+            print(f"{obj_prop=:.3f}")
+
             object_centric_points.append(object_points)
+
 
         self.object_points = np.concatenate(object_centric_points, axis=0)
         self.object_points = voxel_sampling_fast(self.object_points, 0.05, 0.05, 0.05)
 
         self.last_points = points_rigid_transform(self.object_points, optimized_poses[-1])
-        self.last_mesh: trimesh.Trimesh = trimesh.convex.convex_hull(self.last_points)
-        self.optimized_poses = optimized_poses
-
-        undo_last_pose = np.linalg.inv(optimized_poses[-1])
-        object_mesh = self.last_mesh.copy().apply_transform(undo_last_pose)
-        self.optimized_boxes = self._compute_oriented_boxes(timestamps, self.optimized_poses, object_mesh)
-
-        self.positions = [x[:3, 3] for x in optimized_poses]
+        self.last_mesh = trimesh.convex.convex_hull(self.last_points)
 
         return optimized_poses
 
     def compute_poses_(self):
+
         timestamps = self.timestamps
         n_frames = len(timestamps)
 
         world_points_per_timestamp = []
-        # world_centres = []
+        world_centers = []
         
-        # Collect world points and centres
+        # Collect world points and centers
         for i, timestamp_ns in enumerate(timestamps):
             obj: ConvexHullObject = self.history[i]
             world_points = obj.original_points
             world_points_per_timestamp.append(world_points.copy())
             # world_points_per_timestamp.append(obj.mesh.vertices)
-            # centre = obj.box[:3]
-            # world_centres.append(centre)
+            center = obj.box[:3]
+            world_centers.append(center)
 
-        pred_boxes = self.extrapolate_box(timestamps)
-        world_centres = pred_boxes[:, :3]
-
-        world_centres = np.array(world_centres)
-        times_secs = np.array(timestamps, dtype=float) * NANOSEC_TO_SEC
+        world_centers = np.array(world_centers)
+        times_secs = np.array(timestamps, dtype=float) * 1e-9
 
         # heading -> 0, 0, 0 if not moving else we calculate the average.
-        # heading = np.zeros((2,))
-        # if n_frames > 1:
-        #     velocities = []
-        #     for i in range(1, min(n_frames, 5)):
-        #         velocity = (world_centres[i] - world_centres[i-1]) / (times_secs[i] - times_secs[i-1])
-        #         velocities.append(velocity)
+        heading = np.zeros((2,))
+        if n_frames > 1:
+            velocities = []
+            for i in range(1, min(n_frames, 5)):
+                velocity = (world_centers[i] - world_centers[i-1]) / (times_secs[i] - times_secs[i-1])
+                velocities.append(velocity)
 
-        #     velocities = np.stack(velocities, axis=0)
+            velocities = np.stack(velocities, axis=0)
 
-        #     avg_velocity = np.mean(velocities, axis=0)
-        #     avg_speed = np.linalg.norm(avg_velocity[:2])
+            avg_velocity = np.mean(velocities, axis=0)
+            avg_speed = np.linalg.norm(avg_velocity[:2])
 
-        #     self.last_avg_velocity = avg_velocity
+            self.last_avg_velocity = avg_velocity
             
-        #     if avg_speed > self.heading_speed_thresh_ms:
-        #         heading = avg_velocity[:2]
+            if avg_speed > self.heading_speed_thresh_ms:
+                heading = avg_velocity[:2]
 
-        cur_box = self.to_box()
-        yaw_c = cur_box[6]
-        # yaw = np.arctan2(heading[1], heading[0])
-
-        heading = np.array([np.cos(yaw_c), np.sin(yaw_c)])
-        # start_frame = max(1, self._last_processed_frame)
-        start_frame = 1
+        start_frame = max(1, self._last_processed_frame)
         
         if start_frame == 1:
             # First time or full recompute - compute everything
             first_object_pose = self._create_pose_from_object_points_and_heading(
-                world_points_per_timestamp[0], heading, world_centres[0]
+                world_points_per_timestamp[0], heading, world_centers[0]
             )
             initial_poses = [first_object_pose]
             constraints = []
@@ -396,53 +483,119 @@ class ConvexHullTrack:
             constraints = [self._constraint_cache[key] for key in sorted(self._constraint_cache.keys())]
             cumulative_pose = initial_poses[-1].copy()
 
+
+        reference_points, reference_center = world_points_per_timestamp[0], world_centers[0]
+
         for i in range(start_frame, n_frames):
-            constraint_key = (i-1, i)  # Key for frame pair
+            # ICP to reference frame for global consistency
+            centered_ref = reference_points - reference_center
+            centered_curr = world_points_per_timestamp[i] - world_centers[i]
+            
+            # Multi-resolution ICP with yaw-only constraint
+            R, t, A_inliers, B_inliers, icp_cost = relative_object_pose_multiresolution(centered_ref, centered_curr, 
+                                resolutions=[0.2, 0.1, 0.05])
+            
+            pose = np.eye(4)
+            pose[:3, :3] = R
+            pose[:3, 3] = world_centers[i] + R @ (reference_center - world_centers[i])
+            
+            initial_poses.append(pose)
+            
+            # Add sequential constraints
+            if i > 0:
+                R, t, A_inliers, B_inliers, icp_cost = relative_object_pose_multiresolution(world_points_per_timestamp[i-1], world_points_per_timestamp[i])
 
-            undo_pose = np.linalg.inv(cumulative_pose)
+                rel_pose = np.eye(4)
+                rel_pose[:3, :3] = R
+                rel_pose[:3, 3] = t
+                constraints.append({
+                    'frame_i': i-1, 'frame_j': i,
+                    'relative_pose': rel_pose,
+                    'confidence': 0.5
+                })
 
-            prev_points = points_rigid_transform(
-                world_points_per_timestamp[i - 1], undo_pose
-            )
-            cur_points = points_rigid_transform(
-                world_points_per_timestamp[i], undo_pose
-            )
+        # undo_pose = np.linalg.inv(initial_poses[0])
 
-            R, t, A_inliers, B_inliers, icp_cost = relative_object_pose(prev_points, cur_points, max_iterations=self.icp_max_iterations)
+        # cumulative_yaw = Rotation.from_matrix(cumulative_pose[:3, :3]).as_rotvec()[2]
+        # cumulative_pos = cumulative_pose[:3, 3]
 
-            relative_pose = np.eye(4)
-            relative_pose[:3, :3] = R
-            relative_pose[:3, 3] = t
-            confidence = len(A_inliers) / len(cur_points)
+        # for i in range(start_frame, n_frames):
+        #     constraint_key = (i-1, i)  # Key for frame pair
 
-            # Extract current state
-            current_yaw = Rotation.from_matrix(cumulative_pose[:3, :3]).as_rotvec()[2]
-            current_pos = cumulative_pose[:3, 3]
+        #     # undo_pose = np.linalg.inv(cumulative_pose)
 
-            # Extract relative motion
-            relative_yaw = Rotation.from_matrix(R).as_rotvec()[2]
+        #     # prev_points = points_rigid_transform(
+        #     #     world_points_per_timestamp[i - 1], undo_pose
+        #     # )
+        #     # cur_points = points_rigid_transform(
+        #     #     world_points_per_timestamp[i], undo_pose
+        #     # )
 
-            # Compose: add yaws (since Z-rotations commute)
-            new_yaw = wrap_angle(current_yaw + relative_yaw)
+        #     # R, t, A_inliers, B_inliers, icp_cost = relative_object_pose_multiresolution(prev_points, cur_points)
 
-            # Compose: rotate relative translation by current orientation, then add
-            current_rot = cumulative_pose[:3, :3]
-            new_pos = current_pos + current_rot @ t
+        #     # relative_pose = np.eye(4)
+        #     # relative_pose[:3, :3] = R
+        #     # relative_pose[:3, 3] = t
+        #     # confidence = len(A_inliers) / len(cur_points)
 
-            # Rebuild cumulative pose
-            cumulative_pose = np.eye(4)
-            cumulative_pose[:3, :3] = Rotation.from_rotvec([0, 0, new_yaw]).as_matrix()
-            cumulative_pose[:3, 3] = new_pos
-            initial_poses.append(cumulative_pose.copy())
 
-            constraint = {
-                'frame_i': i - 1,
-                'frame_j': i, 
-                'relative_pose': relative_pose,
-                'confidence': confidence,
-            }
-            self._constraint_cache[constraint_key] = constraint
-            constraints.append(constraint)
+        #     prev_points = world_points_per_timestamp[i - 1]
+        #     cur_points = world_points_per_timestamp[i]
+
+        #     mean_err = 1.0
+        #     A = prev_points.copy()
+        #     t_total = np.zeros((3,), float)
+        #     iterations = 0
+        #     while mean_err > self.icp_max_cost and iterations < self.icp_max_iterations:
+        #         A_indices, B_indices, distances = hungarian_matching(A, cur_points)
+        #         A_inliers = A[A_indices]
+        #         B_inliers = cur_points[B_indices]
+
+        #         t = (B_inliers - A_inliers).mean(axis=0)
+        #         t_total += t
+
+        #         mean_err = distances.mean()
+        #         A = A + t
+        #         iterations += 1
+
+        #     print(f"{mean_err=:.2f} after {iterations=}")
+
+        #     dt = times_secs[i] - times_secs[i-1]
+        #     velocity = t_total / dt
+        #     speed = np.linalg.norm(velocity[:2])
+        #     yaw = cumulative_yaw
+            
+        #     if speed > self.heading_speed_thresh_ms:
+        #         yaw = np.arctan2(t_total[1], t_total[0])
+
+        #     R = Rotation.from_rotvec(np.array([0.0, 0.0, yaw], float)).as_matrix()
+
+        #     relative_pose = np.eye(4)
+        #     relative_pose[:3, :3] = R
+        #     relative_pose[:3, 3] = t_total
+        #     confidence = len(A_inliers) / len(cur_points)
+
+        #     # cumulative_pose = cumulative_pose @ relative_pose
+        #     print(f"{cumulative_yaw=} {yaw=}")
+        #     cumulative_yaw = wrap_angle((cumulative_yaw + yaw) / 2)
+        #     cumulative_pos = cumulative_pos + t_total
+
+        #     R = Rotation.from_rotvec(np.array([0.0, 0.0, cumulative_yaw], float)).as_matrix()
+        #     cumulative_pose = np.eye(4)
+        #     cumulative_pose[:3, :3] = R
+        #     cumulative_pose[:3, 3] = cumulative_pos
+            
+
+        #     initial_poses.append(cumulative_pose.copy())
+
+        #     constraint = {
+        #         'frame_i': i - 1,
+        #         'frame_j': i, 
+        #         'relative_pose': relative_pose,
+        #         'confidence': confidence,
+        #     }
+        #     self._constraint_cache[constraint_key] = constraint
+        #     constraints.append(constraint)
 
         # Cache the computed initial poses and update processed frame
         self._cached_initial_poses = initial_poses.copy()
@@ -452,49 +605,223 @@ class ConvexHullTrack:
             timestamps
         ), "Must have one initial pose per timestamp"
 
-        # for pose in initial_poses:
-        #     rot_vec = Rotation.from_matrix(pose[:3, :3]).as_rotvec()
+        self.initial_poses = initial_poses
 
-        #     print("initial rot_vec", rot_vec)
+        optimized_poses, marginals, quality = optimize_with_gtsam_timed(
+            initial_poses, constraints, timestamps
+        )
 
-        # optimized_poses, marginals, quality = optimize_with_gtsam_timed(
-        #     initial_poses, constraints, timestamps
-        # )
+        # optimized_poses = initial_poses
 
-        # for initial_pose, optimized_pose in zip(initial_poses, optimized_poses):
-        #     rot_vec = Rotation.from_matrix(initial_pose[:3, :3]).as_rotvec()
-        #     print('initial_pose rot_vec', rot_vec)
-        #     rot_vec = Rotation.from_matrix(optimized_pose[:3, :3]).as_rotvec()
-        #     print('optimized_pose rot_vec', rot_vec)
+        # optimized_poses, marginals, quality = optimize_with_gtsam_timed_positions(world_centers, constraints, timestamps)
 
-        optimized_poses = initial_poses
 
         # update points
         # Now transform points to object-centric coordinates
-        extrapolated_object_points = []
         object_centric_points = []
-        extrapolated_boxes = self.extrapolate_box([x.timestamp for x in self.history])
-        for i, (convex_hull_obj, obj_pose) in enumerate(zip(self.history, optimized_poses)):
+        l, w, h = self.c[3:6]
+
+        for convex_hull_obj, obj_pose in zip(self.history, optimized_poses):
             # Get world points
             world_points = convex_hull_obj.original_points
 
-            obj_pose_vector_box = PoseKalmanFilter.box_to_pose_vector(extrapolated_boxes[i])
-            obj_pose_box = PoseKalmanFilter.pose_vector_to_transform(obj_pose_vector_box)
+            # Transform to object-centric: multiply by inverse of object pose
+            world_to_object = np.linalg.inv(obj_pose)
+            object_points = points_rigid_transform(world_points, world_to_object)
 
-            optimized_obj_pose_vector = PoseKalmanFilter.transform_to_pose_vector(obj_pose)
+            object_points_mask = (np.abs(object_points[:, 0]) < l/2) & (np.abs(object_points[:, 1]) < w/2) & (np.abs(object_points[:, 2]) < h/2)
+            obj_prop = object_points_mask.sum() / object_points_mask.size
+            object_points = object_points[object_points_mask]
+            print(f"{obj_prop=:.3f}")
 
-            print("obj_pose_vector_box", obj_pose_vector_box)
-            print("optimized_obj_pose_vector", optimized_obj_pose_vector)
+            object_centric_points.append(object_points)
 
+
+        self.object_points = np.concatenate(object_centric_points, axis=0)
+        self.object_points = voxel_sampling_fast(self.object_points, 0.05, 0.05, 0.05)
+
+        self.last_points = points_rigid_transform(self.object_points, optimized_poses[-1])
+        self.last_mesh = trimesh.convex.convex_hull(self.last_points)
+        self.optimized_poses = optimized_poses
+
+        # undo_last_pose = np.linalg.inv(optimized_poses[-1])
+        # object_mesh_vertices = points_rigid_transform(self.last_mesh.vertices.copy(), undo_last_pose)
+
+        self.positions = [x[:3, 3] for x in optimized_poses]
+
+        self.optimized_boxes = self._compute_oriented_boxes(timestamps, self.optimized_poses, self.object_points)
+
+        dims_mins = self.object_points.min(axis=0)
+        dims_maxes = self.object_points.max(axis=0)
+
+        self.lwh = dims_maxes - dims_mins
+
+        return optimized_poses
+
+    def compute_posesx(self):
+        timestamps = self.timestamps
+        n_frames = len(timestamps)
+
+        world_points_per_timestamp = []
+        history_boxes = []
+        
+        # Collect world points and centres
+        for i, timestamp_ns in enumerate(timestamps):
+            obj: ConvexHullObject = self.history[i]
+            world_points = obj.original_points
+            world_points_per_timestamp.append(world_points.copy())
+            history_boxes.append(obj.box)
+
+        history_boxes = np.stack(history_boxes, axis=0)
+        history_positions = history_boxes[:, :3]
+
+        times_secs = np.array(timestamps, float) * NANOSEC_TO_SEC
+
+        dt = np.diff(times_secs)
+        velocities = np.diff(history_positions, axis=0) / dt[:, np.newaxis]
+        speeds = np.linalg.norm(velocities[:, :2], axis=1)
+
+        avg_speed = np.mean(speeds)
+
+        not_moving = avg_speed < self.heading_speed_thresh_ms
+
+        pred_boxes = self.extrapolate_box(timestamps)
+
+        initial_poses = []
+        for box in pred_boxes:
+            pose_vector = PoseKalmanFilter.box_to_pose_vector(box)
+            pose = PoseKalmanFilter.pose_vector_to_transform(pose_vector)
+            initial_poses.append(pose)
+
+        if not_moving:
+            mean_pose = np.stack(initial_poses, axis=0).mean(axis=0)
+            initial_poses = [mean_pose] * len(initial_poses)
+
+        # if not not_moving:
+        #     # start_frame = max(1, self._last_processed_frame)
+        #     start_frame = 1
+        #     constraints = [self._constraint_cache[key] for key in sorted(self._constraint_cache.keys())]
+            
+        #     self._constraint_cache = {}
+
+        #     for i in range(start_frame, n_frames):
+        #         constraint_key = (i-1, i)  # Key for frame pair
+
+        #         prev_pose = initial_poses[i-1]
+        #         cur_pose = initial_poses[i]
+
+        #         undo_pose = np.linalg.inv(prev_pose)
+
+        #         prev_points = points_rigid_transform(
+        #             world_points_per_timestamp[i - 1], undo_pose
+        #         )
+        #         cur_points = points_rigid_transform(
+        #             world_points_per_timestamp[i], undo_pose
+        #         )
+
+        #         # calculate yaw / position difference using initial poses
+        #         prev_yaw = Rotation.from_matrix(prev_pose[:3, :3]).as_rotvec()[2]
+        #         prev_pose_pos = prev_pose[:3, 3]
+
+        #         cur_yaw = Rotation.from_matrix(cur_pose[:3, :3]).as_rotvec()[2]
+        #         cur_pose_pos = cur_pose[:3, 3]
+
+        #         # Get initial relative transformation from poses
+        #         rel_yaw = cur_yaw - prev_yaw
+        #         rel_position = cur_pose_pos - prev_pose_pos
+
+        #         print("rel_yaw", rel_yaw)
+        #         print("rel_position", rel_position)
+
+        #         # Create transformation matrix
+        #         R_init = Rotation.from_rotvec([0, 0, rel_yaw]).as_matrix()
+        #         # prev_points_proj = (prev_points.copy() - prev_pose_pos) @ R_init.T + cur_pose_pos
+        #         prev_points_proj = prev_points.copy() @ R_init.T + rel_position
+
+
+        #         # Check alignment
+        #         indices1, indices2, distances = hungarian_matching(prev_points_proj, cur_points)
+        #         mean_distance = np.mean(distances)
+
+        #         alignment_threshold = 0.1
+
+        #         refine = False
+        #         if mean_distance > alignment_threshold:
+        #             # Use ICP to refine (work in cur_pose coordinate system)
+        #             A, B = prev_points_proj[indices1], cur_points[indices2]
+        #             analytical_R, analytical_t = analytical_z_rotation_centered(A, B)
+                    
+        #             analytical_yaw = Rotation.from_matrix(analytical_R).as_rotvec()[2]
+        #             # Apply refinement to relative pose
+        #             yaw = wrap_angle(rel_yaw + analytical_yaw)
+        #             R = Rotation.from_rotvec(np.array([0, 0, yaw], float)).as_matrix()
+        #             t = rel_position + analytical_t
+
+        #             print("rel_yaw + analytical_yaw", rel_yaw + analytical_yaw)
+        #             print("rel_position + analytical_t", t)
+
+        #             refine = True
+        #         else:
+        #             R = R_init
+        #             t = rel_position
+
+        #         relative_pose = np.eye(4)
+        #         relative_pose[:3, :3] = R
+        #         relative_pose[:3, 3] = t
+
+        #         if refine:
+        #             prev_points_proj = points_rigid_transform(prev_points, relative_pose)
+        #             distances = hungarian_matching(prev_points_proj, cur_points)[2]
+
+        #             after_mean_distance = np.mean(distances)
+
+        #             print("mean_distance, after_mean_distance", mean_distance, after_mean_distance)
+
+        #         A_inliers = np.sum(distances <= alignment_threshold)
+        #         confidence = A_inliers / distances.shape[0]
+
+        #         constraint = {
+        #             'frame_i': i - 1,
+        #             'frame_j': i, 
+        #             'relative_pose': relative_pose,
+        #             'confidence': confidence,
+        #         }
+        #         self._constraint_cache[constraint_key] = constraint
+        #         self._last_processed_frame = i
+        #         constraints.append(constraint)
+
+        #     optimized_poses, marginals, quality = optimize_with_gtsam_timed(
+        #         initial_poses, constraints, timestamps
+        #     )
+        # else:
+        #     # mean_pose = np.stack(initial_poses, axis=0).mean(axis=0)
+        #     positions = np.stack([x[:3, 3] for x in initial_poses], axis=0)
+        #     yaws = np.stack([Rotation.from_matrix(x[:3, :3]).as_rotvec()[2] for x in initial_poses], axis=0)
+        #     yaw = np.median(yaws)
+
+        #     R = Rotation.from_rotvec(np.array([0, 0, yaw], float)).as_matrix()
+
+        #     optimized_poses = []
+        #     for pos in positions:
+        #         pose = np.eye(4)
+        #         pose[:3, :3] = R
+        #         pose[:3, 3] = pos
+        #         optimized_poses.append(pose)
+
+        optimized_poses = initial_poses
+
+            
+        # update points
+        # Now transform points to object-centric coordinates
+        object_centric_points = []
+        for i, (convex_hull_obj, obj_pose) in enumerate(zip(self.history, optimized_poses)):
+            # Get world points
+            world_points = convex_hull_obj.original_points
 
             # Transform to object-centric: multiply by inverse of object pose
             world_to_object = np.linalg.inv(obj_pose)
             object_points = points_rigid_transform(world_points, world_to_object)
             object_centric_points.append(object_points)
-
-            # world_to_object = np.linalg.inv(obj_pose_box)
-            # object_points = points_rigid_transform(world_points, world_to_object)
-            # extrapolated_object_points.append(object_points)
 
         self.object_points = np.concatenate(object_centric_points, axis=0)
         self.object_points = voxel_sampling_fast(self.object_points, 0.05, 0.05, 0.05)
@@ -504,49 +831,14 @@ class ConvexHullTrack:
         self.optimized_poses = optimized_poses
 
         undo_last_pose = np.linalg.inv(optimized_poses[-1])
-        # object_mesh_vertices = points_rigid_transform(self.last_mesh.vertices.copy(), undo_last_pose)
-
         object_mesh = self.last_mesh.copy().apply_transform(undo_last_pose)
+        self.optimized_boxes = self._compute_oriented_boxes(timestamps, self.optimized_poses, object_mesh)
 
         self.positions = [x[:3, 3] for x in optimized_poses]
 
-        self.optimized_boxes = self._compute_oriented_boxes(timestamps, self.optimized_poses, object_mesh)
-
-        # init_timestamp = min(self.timestamps)*1e-9
-        # measurements = np.stack([convex_hull_obj.box for convex_hull_obj in self.history], axis=0)
-
-        # times_offsets = times_secs - init_timestamp
-
-
-        # n_samples, n_features = measurements.shape
-        
-        # # Create design matrix [t, 1] for each timestamp
-        # X = np.column_stack([times_offsets, np.ones(n_samples)])
-        
-        # # Solve least squares: (X^T X)^-1 X^T y for each feature
-        # # This gives us [A_j, c_j] for each feature j
-        # coefficients = np.linalg.lstsq(X, measurements, rcond=None)[0]
-        
-        # A = coefficients[0, :]  # Slopes (7,)
-        # c = coefficients[1, :]  # Intercepts (7,)
-
-        # self.A, self.c = A, c
-
-        # # y = A*t + c (broadcasting handles multiple timestamps)
-        # predictions = A[np.newaxis, :] * times_offsets[:, np.newaxis] + c[np.newaxis, :]
-
-        # eval_r2 = r2_score(measurements, predictions, multioutput='uniform_average')
-        # print(f"Compute poses box R2: {eval_r2:.2f}")
-
-        dims_mins = self.object_points.min(axis=0)
-        dims_maxes = self.object_points.max(axis=0)
-
-        self.lwh = dims_maxes - dims_mins
-
         return optimized_poses
 
-
-    def _compute_oriented_boxes(self, timestamps: List[int], optimized_poses: List[np.ndarray], object_mesh: trimesh.Trimesh):
+    def _compute_oriented_boxes(self, timestamps: List[int], optimized_poses: List[np.ndarray], merged_object_points: np.ndarray): #object_mesh: trimesh.Trimesh):
         """Compute oriented bounding boxes based on object motion direction"""
         boxes = []
 
@@ -554,13 +846,15 @@ class ConvexHullTrack:
             rotvec = Rotation.from_matrix(cur_pose[:3, :3]).as_rotvec()
             yaw = rotvec[2]
 
-            # cur_points = points_rigid_transform(merged_object_points, cur_pose)
-            cur_mesh = object_mesh.copy().apply_transform(cur_pose)
+            cur_points = points_rigid_transform(merged_object_points, cur_pose)
+            # cur_mesh = object_mesh.copy().apply_transform(cur_pose)
 
-            centre = cur_mesh.centroid
+            # centre = cur_mesh.centroid
+            centre = cur_pose[:3, 3]
 
             # Create oriented bounding box from 3D vertices
-            box = self._points_to_oriented_box(cur_mesh.vertices, centre, yaw)
+            # box = self._points_to_oriented_box(cur_mesh.vertices, centre, yaw)
+            box = self._points_to_oriented_box(cur_points, centre, yaw)
             boxes.append(box)
 
         return boxes
@@ -615,14 +909,15 @@ class ConvexHullTrack:
         centre_z = (min_z + max_z) / 2
 
         # FIXED: Rotate centre back to original frame (inverse rotation)
-        centre_rotated = np.array([centre_x, centre_y]) @ rotation_matrix.T
+        # centre_rotated = np.array([centre_x, centre_y]) @ rotation_matrix.T
+        # centre_rotated = centre_rotated + centre[:2]
 
-        centre_rotated = centre_rotated + centre[:2]
+        centre_rotated = centre[:2]
 
-        # length = max_x - min_x  # Forward/backward extent
-        # width = max_y - min_y   # Left/right extent  
-        length = x_max_abs*2
-        width = y_max_abs*2
+        length = max_x - min_x  # Forward/backward extent
+        width = max_y - min_y   # Left/right extent  
+        # length = x_max_abs*2
+        # width = y_max_abs*2
         height = max_z - min_z
 
         return np.array(
@@ -857,6 +1152,47 @@ class ConvexHullTrack:
 
         self.update_box_parameters()
 
+    def update_box_parametersx(self) -> None:
+        """Concise version with key improvements."""        
+        # Prepare data
+        init_timestamp_sec = min(self.timestamps) * NANOSEC_TO_SEC
+        time_offsets = np.array(self.timestamps, dtype=np.float64) * NANOSEC_TO_SEC - init_timestamp_sec
+        
+        # Stack measurements
+        # n_optimized = len(self.optimized_boxes) if self.optimized_boxes else 0
+        optimized_boxes = self.optimized_boxes
+        measurements = np.stack(optimized_boxes, axis=0)
+
+        print("measurements", measurements)
+        exit()
+        
+        lwhs = measurements[:, 3:6]
+        print("lwhs", lwhs.shape, lwhs.min(axis=0), lwhs.max(axis=0))
+        
+        measurements[:, 3:6] = np.mean(lwhs, axis=0).reshape(1, 3).repeat(len(measurements), 0)
+
+        # Validate
+        assert len(measurements) == len(self.timestamps), (
+            f"Measurement/timestamp mismatch: {len(measurements)} vs {len(self.timestamps)}")
+        
+        # Fit model
+        design_matrix = np.column_stack([time_offsets, np.ones(len(time_offsets))])
+        # coefficients, *_ = np.linalg.lstsq(design_matrix, measurements, rcond=None)
+        coefficients, residuals, *_ = np.linalg.lstsq(design_matrix, measurements, rcond=None)
+        self.A, self.c = coefficients[0, :], coefficients[1, :]
+        
+        # Evaluate
+        predictions = self.A * time_offsets[:, np.newaxis] + self.c
+        errs = (measurements - predictions)
+        r2 = r2_score(measurements, predictions, multioutput='uniform_average')
+        rmse = mean_squared_error(measurements, predictions, multioutput='uniform_average')
+        print(f"Box Parameter Update - R²: {r2:.3f} - rmse {rmse:.3f}")
+        # print("errs", errs)
+
+        box = self.to_box()
+        self.mean[:3] = box[:3]
+        self.mean[3] = box[6]
+
     def update_box_parameters(self) -> None:
         """Concise version with key improvements."""        
         # Prepare data
@@ -878,37 +1214,6 @@ class ConvexHullTrack:
         print("lwhs mean", np.mean(lwhs, axis=0))
 
         measurements[:, 3:6] = np.mean(lwhs, axis=0).reshape(1, 3).repeat(len(measurements), 0)
-
-        # yaws = measurements[:, 6]
-        # yaws_diffs = np.diff(yaws, 1, axis=0)
-        # print("yaws", yaws.shape, yaws.min(axis=0), yaws.max(axis=0))
-        # print("yaws median", np.median(yaws))
-        # print("yaws_diffs", yaws_diffs.shape, yaws_diffs.min(axis=0), yaws_diffs.max(axis=0))
-
-        # # chosen_yaw = np.median([x[6] for x in optimized_boxes]) if optimized_boxes else np.median(yaws)
-        # # print("chosen_yaw", chosen_yaw)
-        # chosen_yaw = np.median(yaws)
-
-        # heading = np.array([np.cos(chosen_yaw), np.sin(chosen_yaw)])
-        # n_frames = len(measurements)
-        # world_centres = measurements[:, :3]
-        # if n_frames > 1:
-        #     velocities = []
-        #     for i in range(1, min(n_frames, 5)):
-        #         velocity = (world_centres[i] - world_centres[i-1]) / (time_offsets[i] - time_offsets[i-1])
-        #         velocities.append(velocity)
-
-        #     velocities = np.stack(velocities, axis=0)
-
-        #     avg_velocity = np.mean(velocities, axis=0)
-        #     avg_speed = np.linalg.norm(avg_velocity[:2])
-            
-        #     if avg_speed > self.heading_speed_thresh_ms:
-        #         heading = avg_velocity[:2]
-
-        # chosen_yaw = np.arctan2(heading[1], heading[0])
-
-        # measurements[:, 6] = chosen_yaw.reshape(1).repeat(len(measurements))
 
         positions = measurements[:, :3]
         

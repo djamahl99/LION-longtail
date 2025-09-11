@@ -57,6 +57,10 @@ from lion.unsupervised_core.convex_hull_tracker.convex_hull_track import (
     ConvexHullTrackState,
 )
 from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
+    box_iou_3d,
+    point_in_triangle_vectorized,
+    render_triangle_with_fillpoly_barycentric,
+    save_depth_buffer_colorized,
     voxel_sampling_fast,
 )
 from lion.unsupervised_core.tracker.box_op import register_bbs
@@ -376,9 +380,9 @@ class OWLViTAlphaShapeMFCF:
         self.debug = debug
         self.split = split
 
-        self.min_box_iou = 0.1
-        self.lidar_connected_components_eps = 1.0
-        self.min_component_points = 10
+        self.min_box_iou = 0.3
+        self.lidar_connected_components_eps = 0.5
+        self.min_component_points = 15
 
         self.nms_iou_threshold = 0.7
         self.nms_query_distance = 5.0 # metres
@@ -943,6 +947,131 @@ class OWLViTAlphaShapeMFCF:
 
         exit()
 
+    def _get_instance_buffers(self, component_meshes: List[trimesh.Trimesh], camera_models: Dict[str, PinholeCamera], timestamp_city_SE3_ego_dict, sweep_camera_name_timestamps: List[Tuple], sweep_timestamp_ns: int):
+        instance_buffers = {}
+
+        all_centroids = np.stack([x.centroid for x in component_meshes], axis=0)
+        all_dims = np.stack([x.vertices.max(axis=0) - x.vertices.min(axis=0) for x in component_meshes], axis=0)
+        all_vols = np.prod(all_dims, axis=1)
+
+        all_dists = np.linalg.norm(all_centroids, axis=1)
+
+        cost = (all_dists / all_dists.max()) * (all_vols / all_vols.max())
+
+        ordered = np.argsort(cost, axis=0)
+
+        cmap = plt.get_cmap("tab20", len(component_meshes))
+
+        for camera_name, cam_timestamp_ns in sweep_camera_name_timestamps:
+            city_SE3_ego_cam_t = timestamp_city_SE3_ego_dict[cam_timestamp_ns]
+            city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[sweep_timestamp_ns]
+            camera_model = camera_models[camera_name]
+
+            height = camera_model.height_px
+            width = camera_model.width_px
+
+            depth_buffer = np.full((height, width), np.inf)  # Z-buffer for occlusion handling
+            instance_buffer = np.full((height, width), -1)
+            # rendered_image = np.zeros((height, width, 3), int)
+
+            for idx in ordered:
+                mesh = component_meshes[idx]
+
+                (
+                    uv_points,
+                    points_cam,
+                    is_valid_points,
+                ) = camera_model.project_ego_to_img_motion_compensated(
+                    mesh.vertices,
+                    city_SE3_ego_cam_t=city_SE3_ego_cam_t,
+                    city_SE3_ego_lidar_t=city_SE3_ego_lidar_t,
+                )
+
+                color = cmap(idx)
+                color = tuple((np.array(color)[:3]*255).astype(int).tolist())
+
+                uvs = uv_points[:, :2]
+                depths = points_cam[:, 2]
+                cam_mask = is_valid_points
+
+                if not np.any(cam_mask):
+                    continue
+
+                # Render each triangular face
+                for face in mesh.faces:
+                    # Get the vertices of the triangle
+                    tri_verts_2d = uvs[face]  # (3, 2): Triangle in 2D space
+                    tri_depths = depths[face]  # (3,): Depth of the triangle vertices
+                    tri_mask = cam_mask[face]
+
+                    if np.any(tri_depths < 0) or not np.any(tri_mask):
+                        continue
+
+                    # Compute the average depth of the triangle
+                    avg_depth = np.mean(tri_depths)
+
+                    # # Create a mask for the triangle
+                    # tri_mask = np.zeros((height, width), dtype=np.uint8)
+                    # tri_verts_2d = tri_verts_2d.astype(int)
+                    # cv2.fillConvexPoly(tri_mask, tri_verts_2d, 1)
+                    
+                    # # Find pixels where this triangle is visible (closer than current depth buffer)
+                    # visible_pixels = (tri_mask > 0) & (avg_depth < depth_buffer)
+                    
+                    # Compute bounding box
+                    min_x = max(0, int(np.floor(tri_verts_2d[:, 0].min())))
+                    max_x = min(width - 1, int(np.ceil(tri_verts_2d[:, 0].max())))
+                    min_y = max(0, int(np.floor(tri_verts_2d[:, 1].min())))
+                    max_y = min(height - 1, int(np.ceil(tri_verts_2d[:, 1].max())))
+                    
+                    if min_x >= max_x or min_y >= max_y:
+                        continue
+                    
+                    # Pre-compute for point-in-triangle test
+                    v0, v1, v2 = tri_verts_2d
+                    
+                    # Use vectorized point-in-triangle test
+                    y_coords, x_coords = np.mgrid[min_y:max_y+1, min_x:max_x+1]
+                    points = np.stack([x_coords.ravel(), y_coords.ravel()], axis=1).astype(np.float32)
+                    
+                    # Fast point-in-triangle test using cross products
+                    inside_mask = point_in_triangle_vectorized(points, v0, v1, v2)
+                    
+                    if not np.any(inside_mask):
+                        continue
+                    
+                    # Get valid pixel coordinates
+                    valid_points = points[inside_mask].astype(int)
+                    valid_y, valid_x = valid_points[:, 1], valid_points[:, 0]
+                    
+                    # Update depth buffer where triangle is closer
+                    closer_mask = avg_depth < depth_buffer[valid_y, valid_x]
+                    
+                    if np.any(closer_mask):
+                        update_y = valid_y[closer_mask]
+                        update_x = valid_x[closer_mask]
+                        
+                        depth_buffer[update_y, update_x] = avg_depth
+                        # rendered_image[update_y, update_x] = color
+                        instance_buffer[update_y, update_x] = idx
+
+            instance_buffers[camera_name] = instance_buffer
+            # save_depth_buffer_colorized(depth_buffer, f"depth_buffer_{camera_name}.jpg")
+            # cv2.imwrite(f"rendered_image_{camera_name}.jpg", rendered_image)
+
+        # pr.disable()
+
+        # s = io.StringIO()
+        # sortby = "cumtime"
+        # ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+        # ps.print_stats()
+        # with open(
+        #     "depth_buffer_analysis.txt", "w"
+        # ) as f:
+        #     f.write(s.getvalue())
+
+        return instance_buffers
+
     def _get_vision_guided_clusters(
         self,
         points: np.ndarray,
@@ -974,14 +1103,14 @@ class OWLViTAlphaShapeMFCF:
         # print(f"before ground removal: {points_orig_shape} after: {points.shape}")
 
         # pre run connected components?
-        lidar_connected_components_labels, lidar_n_components = fast_connected_components(points, eps=self.lidar_connected_components_eps)
+        # lidar_connected_components_labels, lidar_n_components = fast_connected_components(points, eps=self.lidar_connected_components_eps)
 
         lidar_connected_components_infos = {}
 
         # turn them into meshes?
         lidar_meshes = []
         all_cmp_vertices = []
-        all_cmp_labels = []
+        # all_cmp_labels = []
 
         num_no_box = 0
         num_w_box = 0
@@ -990,49 +1119,156 @@ class OWLViTAlphaShapeMFCF:
         track_cmp_indices = set()
         n_vertices_per_cmp = {}
 
-        for cmp_lbl in range(lidar_n_components):
-            mask = (lidar_connected_components_labels == cmp_lbl)
+        component_meshes = []
+        component_boxes = []
+        component_vols = []
+        component_densities = []
+        component_original_points = []
 
-            if mask.sum() > 25:
+        cmp_lbl = 0
+        for eps in [1.0]:
+            components_labels, n_components = fast_connected_components(points, eps=eps)
+
+            for cmp_lbl_ in range(n_components):
+                mask = (components_labels == cmp_lbl_)
+
                 cmp_points = points[mask]
-                mesh = trimesh.convex.convex_hull(cmp_points)
-                vertices = mesh.vertices
-            elif mask.sum() >= self.min_component_points:
-                vertices = points[mask]
-            else:
-                vertices = np.zeros((0, 3), dtype=np.float32)
 
-            lidar_cmp_indices.add(cmp_lbl)
+                dims_mins = cmp_points.min(axis=0)
+                dims_maxes = cmp_points.max(axis=0)
 
-            # lidar_meshes.append(mesh)
-            all_cmp_vertices.append(vertices)
+                lwh = dims_maxes - dims_mins
+
+                # if np.any(lwh > 15) or np.any(lwh < 0.1):
+                    # print(f"ConvexHullObject: Cluster too large! {lwh=}")
+                    # return None
+
+                volume = np.prod(lwh)
+                sorted_dims = np.sort(lwh)  # [smallest, medium, largest]
+
+                if volume > 200: # TODO: add these to config
+                    continue
+                elif volume < 0.0001:  # Very small volume (0.1 liter)
+                    continue
+                elif sorted_dims[0] < 0.005:  # 5mm absolute minimum 
+                    continue
+                elif sorted_dims[1] < 0.05:  # Second dimension must be at least 5cm
+                    continue
+                elif sorted_dims[2] > 20: 
+                    continue
+
+                if mask.sum() > self.min_component_points:
+                    mesh = trimesh.convex.convex_hull(cmp_points)
+                    centre = mesh.centroid
+
+                    if np.linalg.norm(centre[:2]) > 75:
+                        continue # TODO: config -> too far
+
+                    component_original_points.append(cmp_points)
+                    component_meshes.append(mesh)
+                    component_boxes.append(ConvexHullObject.points_to_bounding_box(mesh.vertices, mesh.centroid))
+                    component_vols.append(volume)
+
+                    density = mask.sum() / volume
+                    component_densities.append(density)
+
+                    vertices = mesh.vertices
+                    lidar_cmp_indices.add(cmp_lbl)
+                    all_cmp_vertices.append(vertices)
+                    # all_cmp_labels.append(np.full((len(vertices),), fill_value=cmp_lbl))
+                    n_vertices_per_cmp[cmp_lbl] = len(vertices)
+
+                    cmp_lbl += 1
+
+
+        # component nms
+        component_densities = np.array(component_densities, float)
+        ordered = np.argsort(-1.0*component_densities)
+
+        print("component_densities", component_densities.shape)
+        print("component_densities ordered", component_densities[ordered])
+
+        iou_thresh = 0.5
+        suppressed = set()
+        keep_indices = []
+
+        for i in range(len(ordered)):
+            idx1 = ordered[i]
+            if idx1 in suppressed:
+                continue
+
+            keep_indices.append(idx1)
+
+            for j in range(i+1, len(ordered)):
+                idx2 = ordered[j]
+                if idx2 in suppressed:
+                    continue
+
+                iou = box_iou_3d(component_boxes[idx1], component_boxes[idx2])
+
+                if iou > iou_thresh:
+                    suppressed.add(idx2)
+
+        keep_indices = set(keep_indices) # fast lookup
+
+        # have to be in the same order as all_cmp_labels
+        component_boxes = [x for i, x in enumerate(component_boxes) if i in keep_indices]
+        component_densities = [x for i, x in enumerate(component_densities) if i in keep_indices]
+        component_vols = [x for i, x in enumerate(component_vols) if i in keep_indices]
+        component_meshes = [x for i, x in enumerate(component_meshes) if i in keep_indices]
+        component_original_points = [x for i, x in enumerate(component_original_points) if i in keep_indices]
+
+        # prune all_cmp_labels with keep indices...
+        # all_cmp_vertices = [x for i, x in enumerate(all_cmp_vertices) if i in keep_indices]
+        # all_cmp_labels = [x for i, x in enumerate(all_cmp_labels) if i in keep_indices]
+        all_cmp_labels = []
+        all_cmp_vertices_ = []
+        for cmp_lbl, idx in enumerate(list(sorted(keep_indices))):
+            vertices = all_cmp_vertices[idx]
+            all_cmp_vertices_.append(vertices)
             all_cmp_labels.append(np.full((len(vertices),), fill_value=cmp_lbl))
-            n_vertices_per_cmp[cmp_lbl] = len(vertices)
+
+        all_cmp_vertices = all_cmp_vertices_
+
+        lidar_n_components = len(keep_indices)
+
+        print(f"{len(keep_indices)=} {len(suppressed)=}")
+
+        # filter the camera images for ones with this sweep
+        sweep_camera_name_timestamps = [
+            (camera_name, cam_timestamp_ns)
+            for camera_name, cam_timestamp_ns, sweep_timestamp_ns in camera_name_timestamps
+            if sweep_timestamp_ns == timestamp_ns
+        ]
+
+
+        instance_buffers = self._get_instance_buffers(component_meshes, camera_models, timestamp_city_SE3_ego_dict, sweep_camera_name_timestamps, timestamp_ns)
+
 
         # add confirmed tracklets
         track_ids = []
-        label_to_track_id = {}
-        track_label = lidar_n_components
-        world_to_ego = np.linalg.inv(city_SE3_ego_lidar_t.transform_matrix)
-        for track_idx, track in enumerate(tracker.tracks):
-            # if not track.is_confirmed():
-            #     continue
+        # label_to_track_id = {}
+        # track_label = lidar_n_components
+        # world_to_ego = np.linalg.inv(city_SE3_ego_lidar_t.transform_matrix)
+        # for track_idx, track in enumerate(tracker.tracks):
+        #     # if not track.is_confirmed():
+        #     #     continue
 
-            assert track_idx == track.track_id
+        #     assert track_idx == track.track_id
 
-            vertices = get_rotated_3d_box_corners(track.to_box())
-            vertices_ego = points_rigid_transform(vertices, world_to_ego)
-            track_ids.append(track.track_id)
+        #     vertices = get_rotated_3d_box_corners(track.to_box())
+        #     vertices_ego = points_rigid_transform(vertices, world_to_ego)
+        #     track_ids.append(track.track_id)
 
-            label_to_track_id[track_label] = track.track_id
+        #     label_to_track_id[track_label] = track.track_id
 
-            all_cmp_vertices.append(vertices_ego)
-            all_cmp_labels.append(np.full((len(vertices),), fill_value=track_label))
+        #     all_cmp_vertices.append(vertices_ego)
+        #     all_cmp_labels.append(np.full((len(vertices),), fill_value=track_label))
 
-            track_cmp_indices.add(track_label)
-            n_vertices_per_cmp[track_label] = len(vertices)
+        #     track_cmp_indices.add(track_label)
+        #     n_vertices_per_cmp[track_label] = len(vertices)
 
-            track_label += 1
+        #     track_label += 1
 
         assert track_cmp_indices.isdisjoint(lidar_cmp_indices), f"overlaps {len(track_cmp_indices.intersection(lidar_cmp_indices))} {len(track_cmp_indices)} {len(lidar_cmp_indices)}"
 
@@ -1042,13 +1278,6 @@ class OWLViTAlphaShapeMFCF:
 
         all_cmp_vertices = np.concatenate(all_cmp_vertices, axis=0)
         all_cmp_labels = np.concatenate(all_cmp_labels)
-
-        # filter the camera images for ones with this sweep
-        sweep_camera_name_timestamps = [
-            (camera_name, cam_timestamp_ns)
-            for camera_name, cam_timestamp_ns, sweep_timestamp_ns in camera_name_timestamps
-            if sweep_timestamp_ns == timestamp_ns
-        ]
 
         owlvit_pred_dir = self.owlvit_predictions_dir / self.log_id
 
@@ -1074,12 +1303,10 @@ class OWLViTAlphaShapeMFCF:
             start += n_boxes
 
         iou_matrix = np.zeros((total_boxes, n_components), dtype=np.float32)
+        mask_iou_matrix = np.zeros((total_boxes, n_components), dtype=np.float32)
         objectness_matrix = np.zeros((total_boxes, 1), dtype=np.float32)
         dist_matrix = np.full((total_boxes, n_components), fill_value=1000, dtype=np.float32)
         box_infos = {i: {} for i in range(total_boxes)}
-
-        # cost of matching each lidar point to each box 
-        lidar_cost_matrix = np.full((len(points), total_boxes), fill_value=100, dtype=np.float32)
 
         for box_ids, result in tqdm(
             zip(result_box_ids, results),
@@ -1095,6 +1322,8 @@ class OWLViTAlphaShapeMFCF:
 
             if len(pred_boxes) == 0:
                 continue
+
+            instance_buffer = instance_buffers[camera_name]
 
             objectness_matrix[box_ids, 0] = objectness_scores
 
@@ -1151,35 +1380,11 @@ class OWLViTAlphaShapeMFCF:
 
             box_ious = box_iou(pred_boxes, component_boxes)
 
-            # ################################ project all lidar and compute costs
-            # (
-            #     lidar_uv_points,
-            #     _,
-            #     lidar_is_valid_points,
-            # ) = camera_model.project_ego_to_img_motion_compensated(
-            #     points,
-            #     city_SE3_ego_cam_t=city_SE3_ego_cam_t,
-            #     city_SE3_ego_lidar_t=city_SE3_ego_lidar_t,
-            # )
-
-            # lidar_indices = np.where(lidar_is_valid_points)[0]
-            # lidar_uv_points = lidar_uv_points[lidar_is_valid_points]
-
-            # for i, box_idx in enumerate(box_ids):
-            #     x1, y1, x2, y2 = pred_boxes[i]
-
-            #     mask = (lidar_uv_points[:, 0] >= x1) & (lidar_uv_points[:, 1] >= y1) & (lidar_uv_points[:, 0] <= x2) & (lidar_uv_points[:, 1] <= y2)
-
-            #     lidar_indices_box = lidar_indices[mask]
-
-
-
-            # ################################ project all lidar and compute costs
 
             for i, box_idx in enumerate(box_ids):
                 box_xyxy = pred_boxes[i]
                 box_xc = (box_xyxy[:2] + box_xyxy[2:]) / 2.0
-                x1, y1, x2, y2 = box_xyxy
+                x1, y1, x2, y2 = box_xyxy.astype(int)
                 # width = x2 - x1
                 # height = y2 - y1
                 # center = [(x1 + x2) / 2, (y1 + y2) / 2]
@@ -1188,6 +1393,16 @@ class OWLViTAlphaShapeMFCF:
                 box_shape = Polygon.from_bounds(x1, y1, x2, y2)
 
                 mask_in_box = (uv_points[:, 0] >= x1) & (uv_points[:, 1] >= y1) & (uv_points[:, 0] <= x2) & (uv_points[:, 1] <= y2) 
+
+                buffer_in_box = instance_buffer[y1:y2, x1:x2]
+
+                box_area = (x2-x1) * (y2-y1)
+                if buffer_in_box.sum() > 0:
+                    values, counts = np.unique(buffer_in_box, return_counts=True)
+
+                    for value, count in zip(values, counts):
+                        mask_iou_matrix[box_idx, value] = count / box_area
+
 
                 for j, cmp_label in enumerate(valid_cmp_labels):
                     mask = (all_cmp_labels == cmp_label) & is_valid_points & mask_in_box
@@ -1223,29 +1438,11 @@ class OWLViTAlphaShapeMFCF:
         # normalize by the dist
         dist_matrix_normalized = dist_matrix.copy() / dist_matrix.max(axis=1, keepdims=True)
 
-        cost_matrix = dist_matrix_normalized + (1.0 - iou_matrix) + (1.0 - objectness_matrix)
+        cost_matrix = dist_matrix_normalized + (1.0 - iou_matrix) + (1.0 - objectness_matrix) + (1.0 - mask_iou_matrix)
 
         # Greedy assignment
         # clusters_assigned = np.argmin(cost_matrix, axis=1)
         box_assigned, cluster_assigned = linear_sum_assignment(cost_matrix)
-
-        # matches_per_component = {i: (clusters_assigned == i).sum() for i in range(lidar_n_components)}
-        # print(f"matches_per_component", [(k, v) for k, v in matches_per_component.items() if v > 0])
-
-        # matches_per_track = {i: (clusters_assigned == i).sum() for i in range(lidar_n_components, lidar_n_components + n_tracks)}
-        # print(f"matches_per_track", [(k, v) for k, v in matches_per_track.items() if v > 0])
-
-        # ious_tracks = iou_matrix[:, lidar_n_components:].max(axis=0)
-        # print("ious_tracks", ious_tracks)
-        # for cmp_lbl, num_matched in matches_per_component.items():
-        #     if num_matched == 0:
-        #         continue
-
-        #     box_ids = np.where(clusters_assigned == cmp_lbl)[0]
-
-        #     ious = iou_matrix[box_ids, cmp_lbl]
-
-        #     print(f"Component: {cmp_lbl} has IoUs {np.min(ious)} {np.mean(ious)} {np.max(ious)}")
 
         # keep track of which clusters have been assigned.
         clusters_assigned_set = set()
@@ -1311,8 +1508,9 @@ class OWLViTAlphaShapeMFCF:
             needs_filtering = False
 
             # print(f"MATCH: Box {box_idx} <-> Component {cmp_label}: IoU: {iou_matrix[box_idx, cmp_label]:.2f} Distance: {dist_matrix[box_idx, cmp_label]:.2f}")
-            component_mask = (lidar_connected_components_labels == cmp_label)
-            component_3d_points = points[component_mask].copy()
+            # component_mask = (lidar_connected_components_labels == cmp_label)
+            # component_3d_points = points[component_mask].copy()
+            component_3d_points = component_original_points[cmp_label]
 
             num_w_box += 1
 
@@ -1330,8 +1528,8 @@ class OWLViTAlphaShapeMFCF:
                 source="vision_guided"
             )
 
-            # if obj.original_points is not None:
-            #     vision_clusters.append(obj)
+            if full_obj.original_points is not None:
+                vision_clusters.append(full_obj)
 
             (
                 uv_points,
@@ -1384,14 +1582,14 @@ class OWLViTAlphaShapeMFCF:
                 source="vision_guided"
             )
 
-            # if obj.original_points is not None:
-                # vision_clusters.append(obj)
-
-
-            if obj.original_points is not None and in_box_prop < self.nms_iou_threshold:
+            if obj.original_points is not None:
                 vision_clusters.append(obj)
-            elif full_obj.original_points is not None:
-                vision_clusters.append(full_obj)
+
+
+            # if obj.original_points is not None and in_box_prop < self.nms_iou_threshold:
+            #     vision_clusters.append(obj)
+            # elif full_obj.original_points is not None:
+            #     vision_clusters.append(full_obj)
 
         # find non assigned clusters
         non_assigned_clusters = set(cmp_lbl for cmp_lbl in range(lidar_n_components)).difference(clusters_assigned_set)
@@ -1986,7 +2184,7 @@ class OWLViTAlphaShapeMFCF:
                 if track.is_confirmed():
                     next_timestamp_ns = timestamp_ns + 1e+8
                     
-                    boxes = track.extrapolate_box(all_timestamps)
+                    boxes = track.extrapolate_box(track.timestamps) # use the track timestamps rather than all...
                     for box in boxes:
                         center_xy = box[:2]
                         length = box[3]
@@ -2329,8 +2527,9 @@ class OWLViTAlphaShapeMFCF:
 
         non_none = set()
         for track in tqdm(tracker.tracks, desc='Adding tracks to output'):
-            if track.optimized_boxes is None:
+            if track.optimized_boxes is None or track.optimized_poses is None or track.timestamps is None:
                 print(f"optimized_boxes is none for track_id: {track.track_id}")
+                print(f"{track.optimized_boxes=} {track.optimized_poses=} {track.timestamps=}")
                 continue
 
             non_none.add(track.track_id)

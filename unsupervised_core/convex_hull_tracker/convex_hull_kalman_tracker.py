@@ -49,6 +49,7 @@ from lion.unsupervised_core.convex_hull_tracker.convex_hull_track import (
     ConvexHullTrackState,
 )
 from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
+    box_iou_3d,
     relative_object_pose,
     rigid_icp,
     voxel_sampling_fast,
@@ -104,13 +105,13 @@ class ConvexHullKalmanTracker:
 
         self.nms_iou_threshold = 0.1
         self.nms_semantic_threshold: float = 0.9
-        self.nms_query_distance: float = 5.0
+        self.nms_query_distance: float = 15.0
         self.n_points_err_thresh = 0.3
 
         self.min_component_points = 10
 
         self.n_init = 3
-        self.max_age = 10  # 10 frames -> 1 second
+        self.max_age = 5  # 5 frames -> 0.5 seconds
 
         self.updates_per_track = {}
         self.timestamps = []
@@ -209,7 +210,7 @@ class ConvexHullKalmanTracker:
         #             points, track_box[:3]
         #         )
 
-        #         iou = self._box_iou_3d(cur_box, track_box)
+        #         iou = box_iou_3d(cur_box, track_box)
 
         #         # cur_mesh = trimesh.convex.convex_hull(points)
 
@@ -230,20 +231,20 @@ class ConvexHullKalmanTracker:
         #         unmatched_and_found.add(track_idx)
 
         for track_idx in unmatched_tracks:
-            # self.tracks[track_idx].mark_missed()
+            self.tracks[track_idx].mark_missed()
             unmatched_and_missed.add(track_idx)
 
         # tracks_tree = cKDTree([x.to_box()[:3] for x in self.tracks if not x.is_deleted()])
         for detection_idx in unmatched_detections:
-            # ious = np.array([self._box_iou_3d(convex_hulls[detection_idx].box, x.to_box()) for x in self.tracks])
+            # ious = np.array([box_iou_3d(convex_hulls[detection_idx].box, x.to_box()) for x in self.tracks])
             convex_hull_box = convex_hulls[detection_idx].box
             convex_hull_feature = convex_hulls[detection_idx].feature
             found_match = False
             for track in self.tracks:
                 if track.is_deleted():
                     continue
-                iou1 = self._box_iou_3d(convex_hull_box, track.to_box()) 
-                # iou2 = self._box_iou_3d(convex_hull_box, track.history[-1].box)
+                iou1 = box_iou_3d(convex_hull_box, track.to_box()) 
+                # iou2 = box_iou_3d(convex_hull_box, track.history[-1].box)
                 # iou = max(iou1, iou2) 
 
                 iou = iou1
@@ -327,7 +328,7 @@ class ConvexHullKalmanTracker:
                     box1 = tracks_boxes[i, closest_idx]
                     box2 = tracks_boxes[j, closest_idx]
 
-                    iou = self._box_iou_3d(box1, box2)
+                    iou = box_iou_3d(box1, box2)
 
                     track2 = self.tracks[track_idx2]
 
@@ -505,11 +506,16 @@ class ConvexHullKalmanTracker:
         suppressed = set()
 
         semantic_overlaps = sorted_features @ sorted_features.T
+        np.fill_diagonal(semantic_overlaps, 0.0) # fill for min/max sake.
+
         ious = np.zeros_like(semantic_overlaps)
 
         print(
             f"{semantic_overlaps.shape=} {semantic_overlaps.min()} {semantic_overlaps.max()}"
         )
+
+        print("row median", np.median(semantic_overlaps, axis=1))
+        print("row max", np.max(semantic_overlaps, axis=1))
 
         num_tracks = len(sorted_tracks)
         for i in range(num_tracks):
@@ -527,7 +533,7 @@ class ConvexHullKalmanTracker:
                 if j in suppressed or j <= i:
                     continue
 
-                iou = self._box_iou_3d(sorted_boxes[i], sorted_boxes[j])
+                iou = box_iou_3d(sorted_boxes[i], sorted_boxes[j])
                 # iou = self._convex_hull_iou_trimesh(sorted_meshes[i], sorted_meshes[j])
                 semantic_overlap = semantic_overlaps[i, j]
 
@@ -653,11 +659,11 @@ class ConvexHullKalmanTracker:
                 # box = np.copy(pred_box)
                 # box_transformed = register_bbs(box.reshape(1, 7), transform)[0]
 
-                # iou_transformed = self._box_iou_3d(
+                # iou_transformed = box_iou_3d(
                 #     box_transformed, detections[local_det_idx].box
                 # )
 
-                iou = self._box_iou_3d(pred_box, det_box)
+                iou = box_iou_3d(pred_box, det_box)
 
                 # iou = (iou_transformed + iou_default) / 2.0
 
@@ -679,7 +685,8 @@ class ConvexHullKalmanTracker:
 
 
         # compute matches
-        track_matches = np.argmin(cost_matrix, axis=1)
+        # track_matches = np.argmin(cost_matrix, axis=1)
+        track_indices, det_indices = linear_sum_assignment(cost_matrix)
         # track_matches = [i for i, x in enumerate(track_matches) if (iou_matrix[i, x] > (1.0 - self.max_iou_distance)) and (semantic_matrix[i, x] > self.min_semantic_threshold)]
 
         track_set = set(track_idxes)
@@ -690,7 +697,8 @@ class ConvexHullKalmanTracker:
         match_ious = []
 
         matches = []
-        for track_i, matched_det in enumerate(track_matches):
+        # for track_i, matched_det in enumerate(track_matches):
+        for track_i, matched_det in zip(track_indices, det_indices):
             track_idx = track_idxes[track_i]
             # print(f"mach {track_idx=} {matched_det=} iou={iou_matrix[track_idx, matched_det]} semantic={semantic_matrix[track_idx, matched_det]}")
             # print(f"icp_err={icp_matrix[track_idx, matched_det]}")
@@ -752,119 +760,6 @@ class ConvexHullKalmanTracker:
         #     return 0.0
 
         return intersection_volume / union_volume if union_volume > 0 else 0.0
-
-    def _box_iou_3d(self, box1: np.ndarray, box2: np.ndarray):
-        """
-        Calculate 3D IoU between two rotated bounding boxes.
-
-        Args:
-            box1: [x, y, z, l, w, h, yaw] - center coordinates, dimensions, and rotation
-            box2: [x, y, z, l, w, h, yaw] - center coordinates, dimensions, and rotation
-
-        Returns:
-            float: 3D IoU value between 0 and 1
-        """
-
-        def get_box_corners_2d(box):
-            """Get 2D corners of rotated rectangle in XY plane."""
-            x, y, z, l, w, h, yaw = box
-
-            # Half dimensions
-            half_l, half_w = l / 2, w / 2
-
-            # Corner offsets relative to center (before rotation)
-            corners = np.array(
-                [
-                    [-half_l, -half_w],
-                    [half_l, -half_w],
-                    [half_l, half_w],
-                    [-half_l, half_w],
-                ]
-            )
-
-            # Rotation matrix for yaw
-            cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
-            rotation_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
-
-            # Rotate corners and translate to center
-            rotated_corners = corners @ rotation_matrix.T
-            rotated_corners[:, 0] += x
-            rotated_corners[:, 1] += y
-
-            return rotated_corners
-
-        def calculate_z_intersection(box1, box2):
-            """Calculate intersection in Z dimension."""
-            z1, h1 = box1[2], box1[5]
-            z2, h2 = box2[2], box2[5]
-
-            # Z bounds for each box
-            z1_min, z1_max = z1 - h1 / 2, z1 + h1 / 2
-            z2_min, z2_max = z2 - h2 / 2, z2 + h2 / 2
-
-            # Intersection bounds
-            z_min = max(z1_min, z2_min)
-            z_max = min(z1_max, z2_max)
-
-            # Intersection height (0 if no overlap)
-            z_intersection = max(0, z_max - z_min)
-            return z_intersection
-
-        def calculate_xy_intersection_area(box1, box2):
-            """Calculate intersection area in XY plane using Shapely."""
-            try:
-                corners1 = get_box_corners_2d(box1)
-                corners2 = get_box_corners_2d(box2)
-
-                # Create polygons
-                poly1 = Polygon(corners1)
-                poly2 = Polygon(corners2)
-
-                # Ensure polygons are valid
-                if not poly1.is_valid:
-                    poly1 = poly1.buffer(0)
-                if not poly2.is_valid:
-                    poly2 = poly2.buffer(0)
-
-                # Calculate intersection
-                intersection = poly1.intersection(poly2)
-
-                # Return intersection area
-                if intersection.is_empty:
-                    return 0.0
-                else:
-                    return intersection.area
-
-            except Exception:
-                # Fallback: return 0 if any geometric operation fails
-                return 0.0
-
-        # Calculate intersection volume
-        z_intersection = calculate_z_intersection(box1, box2)
-        if z_intersection == 0:
-            return 0.0
-
-        xy_intersection_area = calculate_xy_intersection_area(box1, box2)
-        if xy_intersection_area == 0:
-            return 0.0
-
-        intersection_volume = xy_intersection_area * z_intersection
-
-        # Calculate individual volumes
-        volume1 = box1[3] * box1[4] * box1[5]  # l * w * h
-        volume2 = box2[3] * box2[4] * box2[5]  # l * w * h
-
-        # Calculate union volume
-        union_volume = volume1 + volume2 - intersection_volume
-
-        # Avoid division by zero
-        if union_volume == 0:
-            return 0.0
-
-        # Calculate IoU
-        iou = intersection_volume / union_volume
-
-        return iou
 
     def _initiate_track(self, convex_hull: ConvexHullObject):
         mean, covariance = self.kf.box_initiate(convex_hull.box)
