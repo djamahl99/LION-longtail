@@ -4,8 +4,52 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
+from scipy.spatial.distance import cdist
 from shapely.geometry import MultiPoint, Polygon
 
+from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import wrap_angle
+
+
+def circular_weighted_mean(angles, weights):
+    """More robust circular mean with better numerical stability"""
+    # Normalize weights
+    weights = weights / np.sum(weights)
+    
+    # Convert to unit vectors and compute weighted sum
+    cos_sum = np.sum(weights * np.cos(angles))
+    sin_sum = np.sum(weights * np.sin(angles))
+    
+    # Handle near-zero case
+    if abs(cos_sum) < 1e-8 and abs(sin_sum) < 1e-8:
+        return angles[0]  # Fallback to first angle
+    
+    return np.arctan2(sin_sum, cos_sum)
+
+def predict_pose_with_motion_model(last_pos, last_yaw, velocity, angular_vel, dt):
+    # Limit acceleration to prevent unrealistic jumps    
+    predicted_pos = last_pos + velocity * dt
+    predicted_yaw = wrap_angle(last_yaw + angular_vel * dt)
+    
+    return predicted_pos, predicted_yaw
+
+def compute_confidence_from_icp(points_i, points_j, R, t, cost):
+    """Compute confidence based on point cloud overlap and alignment quality"""
+    # Transform points and compute overlap
+    transformed_j = (R @ points_j.T).T + t
+    
+    # Compute point-to-point distances
+    # distances = cdist(points_i, transformed_j)
+    distances = np.linalg.norm(points_i[:, np.newaxis] - transformed_j[np.newaxis, :], axis=2)
+
+    min_distances = np.min(distances, axis=1)
+    
+    # Overlap ratio (points within reasonable distance)
+    overlap_ratio = np.sum(min_distances < 0.5) / len(points_i)
+    
+    # Inverse cost confidence (lower cost = higher confidence)
+    cost_confidence = 1.0 / (1.0 + cost * 10)
+    
+    return overlap_ratio * cost_confidence
 
 def voxel_sampling_fast(points, res_x=0.1, res_y=0.1, res_z=0.1):
     """Ultra-fast vectorized voxel sampling"""

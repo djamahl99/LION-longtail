@@ -218,6 +218,7 @@ class PoseKalmanFilter(object):
         ndarray
             4D pose vector [x, y, z, rz]
         """
+        assert transform.shape == (4,4), f"Got transform of shape {transform.shape}"
         pose_vector = np.zeros(4)
         pose_vector[:3] = transform[:3, 3]  # translation
         

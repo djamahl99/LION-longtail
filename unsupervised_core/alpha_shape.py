@@ -79,7 +79,7 @@ from .trajectory_optimizer import (
     simple_pairwise_icp_refinement,
 )
 
-PROFILING = True
+PROFILING = False
 
 def iou_multipoint(hull1, hull2) -> float:
     """
@@ -1184,24 +1184,32 @@ class OWLViTAlphaShapeMFCF:
         # component nms
         component_densities = np.array(component_densities, float)
         ordered = np.argsort(-1.0*component_densities)
+        idx2order = {x: i for i, x in enumerate(ordered)}
 
         print("component_densities", component_densities.shape)
         print("component_densities ordered", component_densities[ordered])
 
+        # ordered_positions = np.stack([component_boxes[idx][:3] for idx in ordered], axis=0)
+        positions = np.stack([box[:3] for box in component_boxes], axis=0)
+
         iou_thresh = 0.5
         suppressed = set()
-        keep_indices = []
+        keep_indices = set()
+
+        components_tree = cKDTree(positions)
 
         for i in range(len(ordered)):
             idx1 = ordered[i]
             if idx1 in suppressed:
                 continue
 
-            keep_indices.append(idx1)
+            keep_indices.add(idx1)
 
-            for j in range(i+1, len(ordered)):
-                idx2 = ordered[j]
-                if idx2 in suppressed:
+            indices = components_tree.query_ball_point(positions[idx1], self.nms_query_distance)
+
+            for idx2 in indices:
+                j = idx2order[idx2]
+                if idx2 in suppressed or j in keep_indices:
                     continue
 
                 iou = box_iou_3d(component_boxes[idx1], component_boxes[idx2])
@@ -1994,7 +2002,7 @@ class OWLViTAlphaShapeMFCF:
 
         print(f"{class_features_array.shape=}")
 
-        for i in trange(min(200, len(infos)), desc=f"Generating hybrid alpha shapes"):
+        for i in trange(min(500, len(infos)), desc=f"Generating hybrid alpha shapes"):
             # 1. Load temporal LiDAR window
             aggregated_points = None
             # aggregated_points, cur_points = self._load_temporal_lidar_window(i, infos)
@@ -2178,6 +2186,25 @@ class OWLViTAlphaShapeMFCF:
                             facecolor="none",
                             alpha=1.0,
                             linestyle="--",
+                        )
+                        ax.add_patch(track_polygon)
+
+                if track.spline_boxes is not None:
+                    for box in track.spline_boxes:
+                        center_xy = box[:2]
+                        length = box[3]
+                        width = box[4]
+                        yaw = box[6]
+
+                        # Get rotated box corners
+                        corners = get_rotated_box(center_xy, length, width, yaw)
+                        track_polygon = patches.Polygon(
+                            corners,
+                            linewidth=1,
+                            edgecolor="blue",
+                            facecolor="none",
+                            alpha=0.5,
+                            linestyle="dotted"
                         )
                         ax.add_patch(track_polygon)
 

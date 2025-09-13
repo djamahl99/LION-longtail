@@ -103,7 +103,7 @@ class ConvexHullKalmanTracker:
         self.icp_max_dist = 1.0
         self.icp_max_iterations = 5
 
-        self.nms_iou_threshold = 0.1
+        self.nms_iou_threshold = 0.5
         self.nms_semantic_threshold: float = 0.9
         self.nms_query_distance: float = 15.0
         self.n_points_err_thresh = 0.3
@@ -483,6 +483,9 @@ class ConvexHullKalmanTracker:
             avg_confidence = np.mean([x.confidence for x in track.history])
             return (track.hits, avg_confidence)
 
+        if len(self.tracks) == 0:
+            return set()
+
         sorted_tracks = sorted(
             [x for x in self.tracks if not x.is_deleted()],
             key=get_priority_score,
@@ -502,7 +505,7 @@ class ConvexHullKalmanTracker:
 
         tracks_tree = cKDTree(sorted_positions)
 
-        keep_indices = []
+        keep_indices = set()
         suppressed = set()
 
         semantic_overlaps = sorted_features @ sorted_features.T
@@ -522,7 +525,7 @@ class ConvexHullKalmanTracker:
             if i in suppressed:
                 continue
 
-            keep_indices.append(i)
+            keep_indices.add(i)
 
             # Check all remaining clusters for overlap
             # for j in range(i+1, num_clusters):
@@ -530,7 +533,7 @@ class ConvexHullKalmanTracker:
                 sorted_positions[i], self.nms_query_distance
             )
             for j in indices:
-                if j in suppressed or j <= i:
+                if j in suppressed or j in keep_indices:
                     continue
 
                 iou = box_iou_3d(sorted_boxes[i], sorted_boxes[j])

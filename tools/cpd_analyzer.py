@@ -91,6 +91,33 @@ from lion.unsupervised_core.rotate_iou_cpu_eval import rotate_iou_cpu_eval
 
 np.set_printoptions(suppress=True, precision=2)
 
+import multiprocessing as mp
+import signal
+import threading
+import traceback
+
+
+def signal_handler(signum, frame):
+    # Only print stack trace if we're in the main thread of the main process
+    current_process = mp.current_process()
+    if threading.current_thread() is threading.main_thread() and current_process.name == 'MainProcess':
+        print(f"\n=== PROCESS KILLED (Signal {signum}) ===")
+        print("Stack trace at time of termination:")
+        traceback.print_stack(frame, file="cpd_analyzer_stack.log")
+        print("=" * 60)
+    
+    # Try to gracefully shutdown multiprocessing resources
+    try:
+        # If you have a global pool variable, you can terminate it here
+        # pool.terminate()
+        # pool.join()
+        pass
+    except:
+        pass
+    
+    sys.exit(1)
+
+
 # Remove position-based features that shouldn't affect quality
 IGNORE_COLS = [
     "proto_id_avg",
@@ -4318,7 +4345,7 @@ def train_interpretable_tree(
     features_df: pd.DataFrame,
     target_col="gt_best_iou",
     max_depth=10,
-    min_samples_leaf=100,
+    min_samples_leaf=5,
 ):
     """
     Train an interpretable decision tree and extract decision rules
@@ -4410,7 +4437,7 @@ def train_interpretable_tree(
 
 
 def train_interpretable_classifier(
-    features_df: pd.DataFrame, iou_threshold=0.3, max_depth=10, min_samples_leaf=100
+    features_df: pd.DataFrame, iou_threshold=0.3, max_depth=10, min_samples_leaf=5
 ):
     """
     Train an interpretable decision tree classifier for TP/FP detection
@@ -4541,7 +4568,7 @@ def train_interpretable_tree_category_classifier(
     features_df: pd.DataFrame,
     target_col="gt_best_iou_cat",
     max_depth=10,
-    min_samples_leaf=100,
+    min_samples_leaf=5,
 ):
     """
     Train an interpretable decision tree classifier and extract decision rules for categorical targets
@@ -5413,8 +5440,8 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     for log_id in log_ids:
         output_path = get_owl_alpha_shape_output_path(output_dir, log_id)
 
-        if output_path.exists():
-            os.remove(output_path)
+        # if output_path.exists():
+        #     os.remove(output_path)
 
         if output_path.exists():
             print(f"{output_path=}")
@@ -5429,14 +5456,14 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     # exit()
 
     vis_log_id = '42f92807-0c5e-3397-bd45-9d5303b4db2a'
-    vis_log_id = 'c2d44a70-9fd4-3298-ad0a-c4c9712e6f1e'
+    # vis_log_id = 'c2d44a70-9fd4-3298-ad0a-c4c9712e6f1e'
 
     not_done_log_ids = list(set(owlvit_log_ids).difference(owlvit_alpha_shape_log_ids))
     print(f"not_done_log_ids {len(not_done_log_ids)}")
 
     if len(owlvit_alpha_shape_log_ids) == 0 or True:
-        # for log_id in [np.random.choice(not_done_log_ids)]:  # TODO: do all
-        for log_id in [vis_log_id]:
+        for log_id in [np.random.choice(not_done_log_ids)]:  # TODO: do all
+        # for log_id in [vis_log_id]:
             # pr = cProfile.Profile()
             # pr.enable()
             print(f"running on {log_id=}")
@@ -5547,8 +5574,8 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
             )
 
             # TODO: COMMENT OUT LATER
-            if cur_features_output_path.exists():
-                os.remove(cur_features_output_path)
+            # if cur_features_output_path.exists():
+            #     os.remove(cur_features_output_path)
 
             if not cur_features_output_path.exists():
                 df_features = extract_all_features_accurate(
@@ -5569,8 +5596,17 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
 
         df_features = pd.concat(serialized_dts_list, ignore_index=True)
 
-        non_string_cols = df_features.select_dtypes(exclude=['unicode', 'string']).columns.tolist()
-        print(f"{non_string_cols=}")
+        print("Actual dtypes in DataFrame:")
+        print(df_features.dtypes.value_counts())
+        print("\nUnique dtypes:")
+        print(df_features.dtypes.unique())
+
+        # # Correct way to exclude string-like columns
+        # non_string_cols = df_features.select_dtypes(exclude=['object']).columns.tolist()
+        # print(f"{non_string_cols=}")
+
+        # non_string_cols = df_features.select_dtypes(exclude=['unicode', 'string']).columns.tolist()
+        # print(f"{non_string_cols=}")
 
         # Save if path provided
         if features_output_path is not None:
@@ -5968,6 +6004,10 @@ def analyze_alpha_shape(args, cfg, dataset_dir: Path, output_dir: Path):
 
 
 def main():
+    # Register the signal handler
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
     args, cfg = parse_config()
 
     output_dir = cfg.ROOT_DIR / "output" / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag

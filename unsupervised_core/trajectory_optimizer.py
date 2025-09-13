@@ -3,12 +3,279 @@ from pathlib import Path
 import gtsam
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.interpolate import UnivariateSpline, splev, splprep
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
 from sklearn.cluster import DBSCAN
+
+from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import wrap_angle
 
 from .box_utils import compute_ppscore, icp
 
+
+def smooth_trajectory_with_vehicle_model(timestamps_ns, optimized_poses, 
+                                       heading_speed_thresh=1.0, 
+                                       smoothing_factor=None,
+                                       apply_dynamics_model=True):
+    """
+    Vehicle motion model approach:
+    1. Smooth path geometry with B-splines
+    2. Derive yaw from path tangents (when moving fast enough)
+    3. Apply vehicle dynamics for consistency
+    """
+    times_secs = np.array(timestamps_ns) * 1e-9
+    times_secs = times_secs - times_secs[0]  # Start from 0
+
+    if len(optimized_poses) < 4:
+        return optimized_poses
+    
+    # Extract positions and yaws
+    positions = np.array([pose[:3, 3] for pose in optimized_poses])
+    original_yaws = np.array([Rotation.from_matrix(pose[:3, :3]).as_rotvec()[2] 
+                             for pose in optimized_poses])
+    
+    n_points = len(positions)
+    
+    # Step 1: Smooth the path geometry using parametric B-spline
+    if smoothing_factor is None:
+        # Base smoothing on path length and noise level
+        path_length = np.sum(np.linalg.norm(np.diff(positions[:, :2], axis=0), axis=1))
+        smoothing_factor = max(n_points * 0.1, path_length * 0.01)
+    
+    # smoothing_factor = None
+
+    # print(f"Smoothing 2D path with factor: {smoothing_factor:.3f}")
+    
+    # Parametric spline for XY path
+    tck_xy, u_xy = splprep([positions[:, 0], positions[:, 1]], 
+                           u=times_secs, s=smoothing_factor, k=min(3, n_points-1))
+    
+    # Smooth Z separately
+    z_spline = UnivariateSpline(times_secs, positions[:, 2], 
+                               s=smoothing_factor * 0.5, k=min(3, n_points-1))
+    
+    # Evaluate smoothed path
+    smoothed_xy = np.array(splev(times_secs, tck_xy)).T
+    smoothed_z = z_spline(times_secs)
+    smoothed_positions = np.column_stack([smoothed_xy, smoothed_z])
+    
+    # Step 2: Compute velocities and speeds from smoothed path
+    xy_derivatives = np.array(splev(times_secs, tck_xy, der=1)).T
+    z_derivative = z_spline.derivative()(times_secs)
+    
+    velocities_3d = np.column_stack([xy_derivatives, z_derivative])
+    speeds_2d = np.linalg.norm(xy_derivatives, axis=1)
+    
+    # Step 3: Derive yaw from path tangents (when moving fast enough)
+    path_yaws = np.arctan2(xy_derivatives[:, 1], xy_derivatives[:, 0])
+    
+    # Determine which frames to use path-based yaw vs original yaw
+    use_path_yaw = speeds_2d > heading_speed_thresh
+    n_fast_frames = np.sum(use_path_yaw)
+    
+    print(f"Using path-based yaw for {n_fast_frames}/{n_points} frames (speed > {heading_speed_thresh:.1f} m/s)")
+    
+    # Initialize output yaws
+    smoothed_yaws = original_yaws.copy()
+    
+    if n_fast_frames > 0:
+        # For fast frames, use path tangent yaw
+        # Handle angle wrapping carefully
+        fast_indices = np.where(use_path_yaw)[0]
+
+        fps = path_yaws[fast_indices]
+        xps = times_secs[fast_indices]
+        smoothed_yaws = np.interp(times_secs, xps, fps)
+    else:
+        median_yaw = np.median(original_yaws)
+        smoothed_yaws[:] = median_yaw
+
+    
+    # Step 5: Create smoothed pose matrices
+    smoothed_poses = []
+    for i in range(n_points):
+        pose = np.eye(4)
+        pose[:3, :3] = Rotation.from_rotvec(np.array([0, 0, smoothed_yaws[i]])).as_matrix()
+        pose[:3, 3] = smoothed_positions[i]
+        smoothed_poses.append(pose)
+    
+    # Compute quality metrics
+    position_rmse = np.sqrt(np.mean(np.sum((positions - smoothed_positions)**2, axis=1)))
+    yaw_rmse = np.sqrt(np.mean((original_yaws - smoothed_yaws)**2))
+    
+    print(f"Vehicle Motion Model Results:")
+    print(f"  Position RMSE: {position_rmse:.3f}m")
+    print(f"  Yaw RMSE: {np.degrees(yaw_rmse):.2f}°")
+    # print(f"  Max curvature: {np.max(np.abs(curvatures)):.4f} rad/m")
+    print(f"  Speed range: {np.min(speeds_2d):.1f} - {np.max(speeds_2d):.1f} m/s")
+    
+    return smoothed_poses
+
+
+def smooth_with_vehicle_model(times_secs, optimized_poses, knot_interval=0.5, smoothing_factor=None):
+    """
+    Stable vehicle model: smooth position and yaw separately but with coupling constraints
+    This avoids the integration drift problem while maintaining vehicle dynamics
+    """
+    positions = np.array([pose[:3, 3] for pose in optimized_poses])
+    yaws = np.array([Rotation.from_matrix(pose[:3, :3]).as_rotvec()[2] for pose in optimized_poses])
+    yaws_unwrapped = np.unwrap(yaws)
+    
+    if smoothing_factor is None:
+        smoothing_factor = len(positions) * 0.1
+    
+    # STABLE APPROACH: Smooth position and yaw separately first
+    # Then apply vehicle coupling constraints
+    
+    # 1. Smooth XY positions with parametric spline (maintains path shape)
+    tck_xy, u = splprep([positions[:, 0], positions[:, 1]], 
+                        u=times_secs, s=smoothing_factor, k=3)
+    smoothed_xy = np.array(splev(times_secs, tck_xy)).T
+    
+    # 2. Smooth Z separately 
+    z_spline = UnivariateSpline(times_secs, positions[:, 2], s=smoothing_factor * 0.5, k=3)
+    smoothed_z = z_spline(times_secs)
+    
+    # 3. Smooth yaw with continuity constraint
+    yaw_spline = UnivariateSpline(times_secs, yaws_unwrapped, s=smoothing_factor * 0.1, k=3)
+    smoothed_yaws_unwrapped = yaw_spline(times_secs)
+    
+    # 4. Apply vehicle dynamics coupling constraint
+    # Adjust yaw to be more consistent with motion direction, but gently
+    coupling_strength = 0.3  # How much to couple (0=independent, 1=fully coupled)
+    
+    for i in range(1, len(times_secs) - 1):
+        # Compute motion direction from smoothed positions
+        dx = smoothed_xy[i+1, 0] - smoothed_xy[i-1, 0]
+        dy = smoothed_xy[i+1, 1] - smoothed_xy[i-1, 1]
+        
+        if np.sqrt(dx*dx + dy*dy) > 1e-6:  # Only if moving significantly
+            motion_yaw = np.arctan2(dy, dx)
+            current_yaw = smoothed_yaws_unwrapped[i]
+            
+            # Find the closest equivalent angle (handle wrapping)
+            yaw_options = [motion_yaw, motion_yaw + 2*np.pi, motion_yaw - 2*np.pi]
+            yaw_errors = [abs(wrap_angle(opt - current_yaw)) for opt in yaw_options]
+            best_motion_yaw = yaw_options[np.argmin(yaw_errors)]
+            
+            # Gently pull yaw toward motion direction
+            yaw_correction = coupling_strength * (best_motion_yaw - current_yaw)
+            smoothed_yaws_unwrapped[i] += yaw_correction
+    
+    # 5. Compute vehicle dynamics metrics
+    distances = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(smoothed_xy, axis=0), axis=1))])
+    curvatures = np.zeros(len(positions))
+    speeds = np.zeros(len(positions))
+    
+    for i in range(1, len(times_secs)):
+        dt = times_secs[i] - times_secs[i-1]
+        ds = distances[i] - distances[i-1]
+        
+        if ds > 1e-6 and dt > 1e-6:
+            speeds[i] = ds / dt
+            dyaw = smoothed_yaws_unwrapped[i] - smoothed_yaws_unwrapped[i-1]
+            curvatures[i] = dyaw / ds
+        else:
+            speeds[i] = speeds[i-1] if i > 0 else 0
+            curvatures[i] = curvatures[i-1] if i > 0 else 0
+    
+    # Wrap yaws back to [-π, π]
+    smoothed_yaws_wrapped = np.array([wrap_angle(yaw) for yaw in smoothed_yaws_unwrapped])
+    
+    # Combine smoothed positions
+    smoothed_positions = np.column_stack([smoothed_xy, smoothed_z])
+    
+    # Create smoothed pose matrices
+    smoothed_poses = []
+    for i in range(len(times_secs)):
+        pose = np.eye(4)
+        pose[:3, :3] = Rotation.from_rotvec(np.array([0, 0, smoothed_yaws_wrapped[i]])).as_matrix()
+        pose[:3, 3] = smoothed_positions[i]
+        smoothed_poses.append(pose)
+    
+    # Quality metrics
+    position_rmse = np.sqrt(np.mean(np.sum((positions - smoothed_positions)**2, axis=1)))
+    yaw_rmse = np.sqrt(np.mean((yaws - smoothed_yaws_wrapped)**2))
+    
+    # Check for reasonable results
+    if position_rmse > 2.0:
+        print(f"WARNING: Large position RMSE ({position_rmse:.3f}m), smoothing may be too aggressive")
+        print("Consider increasing smoothing_factor or reducing coupling_strength")
+    
+    # Compute derivatives for velocities
+    xy_derivatives = np.array(splev(times_secs, tck_xy, der=1)).T
+    z_derivative = z_spline.derivative()(times_secs)
+    yaw_derivative = yaw_spline.derivative()(times_secs)
+    
+    velocities_2d = xy_derivatives
+    velocities_3d = np.column_stack([velocities_2d, z_derivative])
+    angular_velocities = yaw_derivative
+    
+    spline_info = {
+        'method': 'vehicle_model_stable',
+        'splines': {
+            'xy': tck_xy,
+            'z': z_spline,
+            'yaw': yaw_spline
+        },
+        'coupling_strength': coupling_strength,
+        'smoothing_factor': smoothing_factor,
+        'quality': {
+            'position_rmse': position_rmse,
+            'yaw_rmse_deg': np.degrees(yaw_rmse),
+            'max_curvature': np.max(np.abs(curvatures)),
+            'max_speed': np.max(speeds)
+        },
+        'dynamics': {
+            'velocities': velocities_3d,
+            'angular_velocities': angular_velocities,
+            'curvatures': curvatures,
+            'speeds': speeds
+        },
+        'times_secs': times_secs
+    }
+    
+    print(f"Stable vehicle model smoothing:")
+    print(f"  Position RMSE: {position_rmse:.3f}m")
+    print(f"  Yaw RMSE: {np.degrees(yaw_rmse):.2f}°")
+    print(f"  Max curvature: {np.max(np.abs(curvatures)):.4f} rad/m")
+    print(f"  Coupling strength: {coupling_strength}")
+    
+    return smoothed_poses, spline_info
+
+def refine_with_gtsam(optimized_poses):
+    """Use GTSAM to refine the already-good poses"""
+    graph = gtsam.NonlinearFactorGraph()
+    initial_estimate = gtsam.Values()
+    
+    # Very tight prior on first pose
+    prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+        np.array([0.01, 0.01, 0.01, 0.01, 0.01, 0.01])
+    )
+    graph.add(gtsam.PriorFactorPose3(0, gtsam.Pose3(optimized_poses[0]), prior_noise))
+    
+    # Add poses as initial estimates
+    for i, pose in enumerate(optimized_poses):
+        initial_estimate.insert(i, gtsam.Pose3(pose))
+    
+    # Add sequential constraints with reasonable noise
+    for i in range(len(optimized_poses) - 1):
+        relative_pose = np.linalg.inv(optimized_poses[i]) @ optimized_poses[i+1]
+        noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.1, 0.1, 0.05,  # Tight yaw constraint
+                     0.2, 0.2, 0.2])
+        )
+        graph.add(gtsam.BetweenFactorPose3(i, i+1, gtsam.Pose3(relative_pose), noise))
+    
+    # Optimize
+    params = gtsam.LevenbergMarquardtParams()
+    params.setMaxIterations(50)  # Few iterations since starting point is good
+    
+    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_estimate, params)
+    result = optimizer.optimize()
+    
+    return [result.atPose3(i).matrix() for i in range(len(optimized_poses))]
 
 def optimize_with_gtsam_timed(initial_poses, constraints, timestamps_ns):
     n_poses = len(initial_poses)
