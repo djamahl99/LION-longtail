@@ -103,9 +103,9 @@ class ConvexHullKalmanTracker:
         self.icp_max_dist = 1.0
         self.icp_max_iterations = 5
 
-        self.nms_iou_threshold = 0.5
+        self.nms_iou_threshold = 0.1
         self.nms_semantic_threshold: float = 0.9
-        self.nms_query_distance: float = 15.0
+        self.nms_query_distance: float = 3.0
         self.n_points_err_thresh = 0.3
 
         self.min_component_points = 10
@@ -569,7 +569,7 @@ class ConvexHullKalmanTracker:
 
         return suppressed
 
-    def _match_full(self, detections, pose):
+    def _match_full(self, detections: List[ConvexHullObject], pose):
         n_dets = len(detections)
 
         track_idxes = [
@@ -616,7 +616,7 @@ class ConvexHullKalmanTracker:
             # predicted_shape = track.to_shape_dict()
 
             predicted_centroids.append(predicted_center)
-            # predicted_shapes.append(predicted_shape)
+            predicted_shapes.append(track.to_bev_hull())
 
         for i, track_idx in enumerate(track_idxes):
             track = self.tracks[track_idx]
@@ -630,7 +630,7 @@ class ConvexHullKalmanTracker:
                 predicted_centroids[i], self.track_query_eps
             )
 
-            # predicted_shape = predicted_shapes[i]
+            predicted_shape = predicted_shapes[i]
 
             for local_det_idx in close_detection_indices:
                 # Compute geometric costs
@@ -648,29 +648,59 @@ class ConvexHullKalmanTracker:
                 det_box = detections[local_det_idx].box
                 pred_box = predicted_boxes[i]
 
-                # #
-                # R, t, A_inliers, B_inliers, icp_cost = relative_object_pose(
-                #     predicted_shape["mesh"].vertices,
-                #     detections[local_det_idx].mesh.vertices,
-                #     max_iterations=1,
-                # )
-                # transform = np.eye(4)
-                # transform[:3, :3] = R
-                # transform[:3, 3] = t
-                # # transform[:3, 3] = (det_box[:3] - pred_box[:3])
 
-                # box = np.copy(pred_box)
-                # box_transformed = register_bbs(box.reshape(1, 7), transform)[0]
+                # hull1 = detections[local_det_idx].hull
+                # hull2 = predicted_shape['hull']
 
-                # iou_transformed = box_iou_3d(
-                #     box_transformed, detections[local_det_idx].box
-                # )
+                # # Calculate intersection
+                # z1_min, z1_max = detections[local_det_idx].z_min, detections[local_det_idx].z_max
+                # z2_min, z2_max = predicted_shape['z_min'], predicted_shape['z_max']
+                # intersection_min = max(z1_min, z2_min)
+                # intersection_max = min(z1_max, z2_max)
+                # intersection_height = max(0, intersection_max - intersection_min)
+
+                # # Calculate union
+                # union_min = min(z1_min, z2_min)
+                # union_max = max(z1_max, z2_max)
+                # union_height = union_max - union_min
+
+                # z_iou = 0.0
+
+                # if union_height == 0:
+                #     z_iou = 1.0  # Both have same z
+                
+                # else:
+                #     z_iou = intersection_height / union_height
+
+                # bev_iou = 0.0
+                # # Handle degenerate cases (points, lines)
+                # if hull1.area == 0 or hull2.area == 0:
+                #     bev_iou = 0.0
+                # else:
+
+                #     # Compute intersection and union
+                #     intersection = hull1.intersection(hull2).area
+                #     union = hull1.union(hull2).area
+
+                #     # Return IoU
+                #     bev_iou = intersection / union if union > 0 else 0.0
+
+                # iou = bev_iou * z_iou
 
                 iou = box_iou_3d(pred_box, det_box)
 
                 # iou = (iou_transformed + iou_default) / 2.0
 
-                distance = np.linalg.norm(pred_box[:6] - det_box[:6])
+                distance = np.linalg.norm(pred_box[:3] - det_box[:3])
+
+                if distance < self.nms_query_distance:
+                    box_transformed = np.copy(pred_box)
+                    box_transformed[:3] = det_box[:3]
+
+                    iou_transformed = box_iou_3d(pred_box, det_box)
+
+                    iou = (iou + iou_transformed) / 2.0
+
 
                 iou_matrix[i, local_det_idx] = iou
                 semantic_matrix[i, local_det_idx] = semantic_iou
@@ -724,7 +754,8 @@ class ConvexHullKalmanTracker:
         print(f"matched_dets: {len(matched_dets)} dets_unmatched {len(dets_unmatched)}")
 
         match_ious = np.array(match_ious)
-        print("match_ious", match_ious.min(), np.median(match_ious), np.max(match_ious))
+        if len(match_ious) > 0:
+            print("match_ious", match_ious.min(), np.median(match_ious), np.max(match_ious))
 
         return matches, list(tracks_unmatched), list(dets_unmatched)
 

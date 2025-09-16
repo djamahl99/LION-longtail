@@ -10,6 +10,31 @@ from shapely.geometry import MultiPoint, Polygon
 from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import wrap_angle
 
 
+def draw_ellipse_outline(cx, cy, a, b, theta, n_points=5):
+    """Draw ellipse outline given parameters [cx, cy, a, b, theta]"""
+    
+    # Generate points on unit circle
+    t = np.linspace(0, 2*np.pi, n_points)
+    x_circle = np.cos(t)
+    y_circle = np.sin(t)
+    
+    # Scale by semi-axes
+    x_ellipse = a * x_circle
+    y_ellipse = b * y_circle
+    
+    # Rotate by theta
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+    
+    x_rot = x_ellipse * cos_theta - y_ellipse * sin_theta
+    y_rot = x_ellipse * sin_theta + y_ellipse * cos_theta
+    
+    # Translate to center
+    x_final = x_rot + cx
+    y_final = y_rot + cy
+    
+    return x_final, y_final
+
 def circular_weighted_mean(angles, weights):
     """More robust circular mean with better numerical stability"""
     # Normalize weights
@@ -440,6 +465,13 @@ def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.nda
     # Translation after rotation
     # A_rotated = (R @ A.T).T
     # t = np.mean(B - A_rotated, axis=0)
+
+    # dists_before = np.linalg.norm(B-A, axis=1)
+    # A_rotated = (R @ A_translated.T).T
+    # dists_post_rotate = np.linalg.norm(B-A_rotated, axis=1)
+
+    # print("dists_before", dists_before.min(), dists_before.mean(), dists_before.max())
+    # print("dists_post_rotate", dists_post_rotate.min(), dists_post_rotate.mean(), dists_post_rotate.max())
 
     return R, t
 

@@ -1,9 +1,14 @@
 import numpy as np
 import trimesh
+from shapely.geometry import MultiPoint
 
 from lion.unsupervised_core.box_utils import get_rotated_3d_box_corners
 from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
     voxel_sampling_fast,
+)
+from lion.unsupervised_core.convex_hull_tracker.l_shaped_fit import (
+    LShapeCriterion,
+    LShapedFIT,
 )
 from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import (
     PoseKalmanFilter,
@@ -67,7 +72,7 @@ class ConvexHullObject(object):
 
             indices = np.random.randint(0, cur_len, size=MAX_POINTS)
             original_points = sampled_points[indices]
-            print(f"Resampled original_points {orig_len} -> {len(original_points)}")
+            # print(f"Resampled original_points {orig_len} -> {len(original_points)}")
 
         if len(original_points) < 10:
             return None
@@ -85,15 +90,70 @@ class ConvexHullObject(object):
         self.centroid_3d = self.box[:3]
         self.pose_vector = PoseKalmanFilter.box_to_pose_vector(self.box)
 
+        self.hull = MultiPoint(self.original_points).convex_hull
+        self.z_min, self.z_max = self.original_points[:, 2].min(), self.original_points[:, 2].max()
+
         obj_pose = PoseKalmanFilter.pose_vector_to_transform(self.pose_vector)          
-        
         world_to_object = np.linalg.inv(obj_pose)
         self.object_points = points_rigid_transform(original_points, world_to_object)
 
     @staticmethod
     def points_to_bounding_box(points3d: np.ndarray, centre: np.ndarray) -> np.ndarray:
-        """Convert single alpha shape to bounding box [x, y, z, length, width, height, yaw]."""
+        """Convert points to bounding box [x, y, z, length, width, height, yaw]."""
 
+        box_pca = ConvexHullObject.pca_points_to_bounding_box(points3d, centre)
+        box_lshape = ConvexHullObject.lshape_points_to_bounding_box(points3d, centre)
+
+        lwh_pca = box_pca[3:6]
+        lwh_lshape = box_lshape[3:6]
+
+        if np.prod(lwh_pca) < np.prod(lwh_lshape):
+            return box_pca
+        
+        return box_lshape
+
+    def lshape_points_to_bounding_box(points3d: np.ndarray, centre: np.ndarray, 
+                                angle_resolution: float = 1.0,
+                                criterion: LShapeCriterion = LShapeCriterion.VARIANCE) -> np.ndarray:
+        centre_x, centre_y, centre_z = centre
+        points3d = points3d - centre
+                                
+        points_2d = points3d[:, :2]
+        points_z = points3d[:, 2]
+        
+        # Calculate z-dimension parameters
+        z_min = points_z.min()
+        z_max = points_z.max()
+        height = z_max - z_min
+        
+        # Fit L-shape using the paper's algorithm
+        lshape_fitter = LShapedFIT(
+            dtheta_deg_for_search=angle_resolution,
+            criterion=criterion
+        )
+        
+        result = lshape_fitter.fit_box(points_2d)
+        
+        if result is None:
+            # Fallback to simple bounding box if L-shape fitting fails
+            center_2d = np.mean(points_2d, axis=0)
+            min_pt = np.min(points_2d, axis=0)
+            max_pt = np.max(points_2d, axis=0)
+            length = max_pt[0] - min_pt[0]
+            width = max_pt[1] - min_pt[1]
+            yaw = 0.0
+        else:
+            center_2d = result['center']
+            length, width = result['size']
+            yaw = result['angle_rad']
+
+        centre_x = centre_x + center_2d[0]
+        centre_y = centre_y + center_2d[1]
+        
+        return np.array([centre_x, centre_y, centre_z, length, width, height, yaw])
+
+    @staticmethod
+    def pca_points_to_bounding_box(points3d: np.ndarray, centre: np.ndarray) -> np.ndarray:
         points_2d = points3d[:, :2]
         points_z = points3d[:, 2]
 
@@ -136,7 +196,7 @@ class ConvexHullObject(object):
         return np.array([centre_x, centre_y, centre_z, length, width, height, yaw])
 
     @staticmethod
-    def points_in_box(box: np.ndarray, points3d: np.ndarray):
+    def points_in_box(box: np.ndarray, points3d: np.ndarray, ret_mask: bool = False):
         centre_x, centre_y, centre_z, length, width, height, yaw = box
 
         centre = box[:3]
@@ -154,5 +214,8 @@ class ConvexHullObject(object):
         box_points3d = np.concatenate([rotated_xy, centred_points3d[:, [2]]], axis=1)
         box_points3d_abs = np.abs(box_points3d)
         mask = (box_points3d_abs[:, 0] <= length) & (box_points3d_abs[:, 1] <= width) & (box_points3d_abs[:, 2] <= height)
+
+        if ret_mask:
+            return mask
 
         return points3d[mask]

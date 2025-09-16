@@ -43,6 +43,7 @@ from shapely.ops import unary_union
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm, trange
 
+from lion.unsupervised_core.box_utils import argo2_box_to_lidar
 from lion.unsupervised_core.convex_hull_tracker.alpha_shape_tracker import (
     AlphaShapeTracker,
 )
@@ -58,11 +59,13 @@ from lion.unsupervised_core.convex_hull_tracker.convex_hull_track import (
 )
 from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
     box_iou_3d,
+    draw_ellipse_outline,
     point_in_triangle_vectorized,
     render_triangle_with_fillpoly_barycentric,
     save_depth_buffer_colorized,
     voxel_sampling_fast,
 )
+from lion.unsupervised_core.rotate_iou_cpu_eval import rotate_iou_cpu_eval
 from lion.unsupervised_core.tracker.box_op import register_bbs
 
 from .box_utils import *
@@ -79,7 +82,7 @@ from .trajectory_optimizer import (
     simple_pairwise_icp_refinement,
 )
 
-PROFILING = False
+PROFILING = True
 
 def iou_multipoint(hull1, hull2) -> float:
     """
@@ -1126,7 +1129,7 @@ class OWLViTAlphaShapeMFCF:
         component_original_points = []
 
         cmp_lbl = 0
-        for eps in [1.0]:
+        for eps in [0.5]:
             components_labels, n_components = fast_connected_components(points, eps=eps)
 
             for cmp_lbl_ in range(n_components):
@@ -1255,28 +1258,28 @@ class OWLViTAlphaShapeMFCF:
 
         # add confirmed tracklets
         track_ids = []
-        # label_to_track_id = {}
-        # track_label = lidar_n_components
-        # world_to_ego = np.linalg.inv(city_SE3_ego_lidar_t.transform_matrix)
-        # for track_idx, track in enumerate(tracker.tracks):
-        #     # if not track.is_confirmed():
-        #     #     continue
+        label_to_track_id = {}
+        track_label = lidar_n_components
+        world_to_ego = np.linalg.inv(city_SE3_ego_lidar_t.transform_matrix)
+        for track_idx, track in enumerate(tracker.tracks):
+            # if not track.is_confirmed():
+            #     continue
 
-        #     assert track_idx == track.track_id
+            assert track_idx == track.track_id
 
-        #     vertices = get_rotated_3d_box_corners(track.to_box())
-        #     vertices_ego = points_rigid_transform(vertices, world_to_ego)
-        #     track_ids.append(track.track_id)
+            vertices = get_rotated_3d_box_corners(track.to_box())
+            vertices_ego = points_rigid_transform(vertices, world_to_ego)
+            track_ids.append(track.track_id)
 
-        #     label_to_track_id[track_label] = track.track_id
+            label_to_track_id[track_label] = track.track_id
 
-        #     all_cmp_vertices.append(vertices_ego)
-        #     all_cmp_labels.append(np.full((len(vertices),), fill_value=track_label))
+            all_cmp_vertices.append(vertices_ego)
+            all_cmp_labels.append(np.full((len(vertices),), fill_value=track_label))
 
-        #     track_cmp_indices.add(track_label)
-        #     n_vertices_per_cmp[track_label] = len(vertices)
+            track_cmp_indices.add(track_label)
+            n_vertices_per_cmp[track_label] = len(vertices)
 
-        #     track_label += 1
+            track_label += 1
 
         assert track_cmp_indices.isdisjoint(lidar_cmp_indices), f"overlaps {len(track_cmp_indices.intersection(lidar_cmp_indices))} {len(track_cmp_indices)} {len(lidar_cmp_indices)}"
 
@@ -2002,6 +2005,18 @@ class OWLViTAlphaShapeMFCF:
 
         print(f"{class_features_array.shape=}")
 
+        # load annotations for recall printing
+        vis_annotations_feather = Path(
+            f"/home/uqdetche/lidar_longtail_mining/lion/data/argo2/sensor/val/{self.log_id}/annotations.feather"
+        )
+        assert vis_annotations_feather.exists()
+
+        gts = pd.read_feather(vis_annotations_feather)
+        gts = gts.assign(
+            log_id=pd.Series([self.log_id for _ in range(len(gts))], dtype="string").values
+        )
+        gts = gts.set_index(["log_id", "timestamp_ns"], drop=False).sort_values("category")
+
         for i in trange(min(500, len(infos)), desc=f"Generating hybrid alpha shapes"):
             # 1. Load temporal LiDAR window
             aggregated_points = None
@@ -2015,6 +2030,26 @@ class OWLViTAlphaShapeMFCF:
             )  # Fallback if no timestamp
             assert timestamp_ns is not None, infos[i].keys()
             all_timestamps.append(timestamp_ns)
+
+            gt_frame = gts.loc[[(self.log_id, int(timestamp_ns))]]
+            gt_lidar_boxes = argo2_box_to_lidar(
+                gt_frame[
+                    [
+                        "tx_m",
+                        "ty_m",
+                        "tz_m",
+                        "length_m",
+                        "width_m",
+                        "height_m",
+                        "qw",
+                        "qx",
+                        "qy",
+                        "qz",
+                    ]
+                ].values
+            ).to(dtype=torch.float32)
+
+            gt_categories = gt_frame["category"].values
 
             # 3. Generate both cluster types
             # traditional_clusters = self._get_traditional_clusters(aggregated_points)
@@ -2100,6 +2135,10 @@ class OWLViTAlphaShapeMFCF:
             info_path = str(i).zfill(4) + ".npy"
             lidar_path = os.path.join(self.root_path, self.log_id, info_path)
 
+            all_boxes = []
+            all_labels = []
+            all_box_types = []
+
 
             fig, ax = plt.subplots(figsize=(8,8))
 
@@ -2122,6 +2161,10 @@ class OWLViTAlphaShapeMFCF:
                 length = box[3]
                 width = box[4]
                 yaw = box[6]
+
+                # all_boxes.append(box)
+                # all_labels.append("vision_cluster")
+                # all_box_types.append("box_cluster")
 
                 # Get rotated box corners
                 corners = get_rotated_box(center_xy, length, width, yaw)
@@ -2148,6 +2191,11 @@ class OWLViTAlphaShapeMFCF:
                 width = box[4]
                 yaw = box[6]
 
+
+                all_boxes.append(box)
+                all_labels.append(f"track_{track.track_id}")
+                all_box_types.append("track.to_box()")
+
                 # Get rotated box corners
                 corners = get_rotated_box(center_xy, length, width, yaw)
 
@@ -2170,12 +2218,39 @@ class OWLViTAlphaShapeMFCF:
                 )
                 ax.add_patch(track_polygon)
 
-                if track.optimized_boxes is not None:
-                    for box in track.optimized_boxes:
+                if track.spline_boxes is not None:
+                    for box in track.spline_boxes[-1:]:
+                        all_boxes.append(box)
+                        all_labels.append(f"spline_box_{track.track_id}")
+                        all_box_types.append("spline_box")
+
                         center_xy = box[:2]
                         length = box[3]
                         width = box[4]
                         yaw = box[6]
+
+                        # Get rotated box corners
+                        corners = get_rotated_box(center_xy, length, width, yaw)
+                        track_polygon = patches.Polygon(
+                            corners,
+                            linewidth=1,
+                            edgecolor="red",
+                            facecolor="none",
+                            alpha=0.7,
+                            linestyle="-",
+                        )
+                        ax.add_patch(track_polygon)
+
+                if track.optimized_boxes is not None:
+                    for box in track.optimized_boxes[-1:]:
+                        center_xy = box[:2]
+                        length = box[3]
+                        width = box[4]
+                        yaw = box[6]
+
+                        all_boxes.append(box)
+                        all_labels.append(f"optimized_track_{track.track_id}")
+                        all_box_types.append("optimized_box")
 
                         # Get rotated box corners
                         corners = get_rotated_box(center_xy, length, width, yaw)
@@ -2184,39 +2259,44 @@ class OWLViTAlphaShapeMFCF:
                             linewidth=1,
                             edgecolor=color,
                             facecolor="none",
-                            alpha=1.0,
+                            alpha=0.7,
                             linestyle="--",
                         )
                         ax.add_patch(track_polygon)
 
-                if track.spline_boxes is not None:
-                    for box in track.spline_boxes:
-                        center_xy = box[:2]
-                        length = box[3]
-                        width = box[4]
-                        yaw = box[6]
+                # if track.spline_boxes is not None:
+                #     for box in track.spline_boxes[-1:]:
+                #         center_xy = box[:2]
+                #         length = box[3]
+                #         width = box[4]
+                #         yaw = box[6]
 
-                        # Get rotated box corners
-                        corners = get_rotated_box(center_xy, length, width, yaw)
-                        track_polygon = patches.Polygon(
-                            corners,
-                            linewidth=1,
-                            edgecolor="blue",
-                            facecolor="none",
-                            alpha=0.5,
-                            linestyle="dotted"
-                        )
-                        ax.add_patch(track_polygon)
+                #         # Get rotated box corners
+                #         corners = get_rotated_box(center_xy, length, width, yaw)
+                #         track_polygon = patches.Polygon(
+                #             corners,
+                #             linewidth=1,
+                #             edgecolor="blue",
+                #             facecolor="none",
+                #             alpha=0.5,
+                #             linestyle="dotted"
+                #         )
+                #         ax.add_patch(track_polygon)
 
                 if track.is_confirmed():
                     next_timestamp_ns = timestamp_ns + 1e+8
                     
-                    boxes = track.extrapolate_box(track.timestamps) # use the track timestamps rather than all...
+                    boxes = track.extrapolate_box([timestamp_ns]) # use the track timestamps rather than all...
                     for box in boxes:
                         center_xy = box[:2]
                         length = box[3]
                         width = box[4]
                         yaw = box[6]
+
+                        
+                        all_boxes.append(box)
+                        all_labels.append(f"extrapolate_box_track_{track.track_id}")
+                        all_box_types.append("extrapolated_box")
 
                         # Get rotated box corners
                         corners = get_rotated_box(center_xy, length, width, yaw)
@@ -2225,10 +2305,89 @@ class OWLViTAlphaShapeMFCF:
                             linewidth=1,
                             edgecolor="purple",
                             facecolor="none",
-                            alpha=1.0,
+                            alpha=0.5,
                             linestyle="--",
                         )
                         ax.add_patch(track_polygon)
+
+                    # if track.path_box is not None:
+                    #     box = track.path_box
+                    #     center_xy = box[:2]
+                    #     length = box[3]
+                    #     width = box[4]
+                    #     yaw = box[6]
+
+
+                    #     all_boxes.append(box)
+                    #     all_labels.append(f"path_track_{track.track_id}")
+                    #     all_box_types.append("path_box")
+
+                    #     # Get rotated box corners
+                    #     corners = get_rotated_box(center_xy, length, width, yaw)
+                    #     track_polygon = patches.Polygon(
+                    #         corners,
+                    #         linewidth=1,
+                    #         edgecolor="pink",
+                    #         facecolor="none",
+                    #         alpha=0.5,
+                    #         linestyle="dotted",
+                    #     )
+                    #     ax.add_patch(track_polygon)
+
+                    for ellipse_params in track.ellipses[-1:]:
+                        lw = np.linalg.norm(track.lwh) # big enough to cover?
+
+                        cx, cy, cz, a, b, h, theta = ellipse_params
+
+                        ellipse_box = ellipse_params.copy()
+                        ellipse_box[3:5] *= 2
+
+                        all_boxes.append(ellipse_box)
+                        all_labels.append(f"ellipse_track_{track.track_id}")
+                        all_box_types.append("ellipse_box")
+
+                        x_outline, y_outline = draw_ellipse_outline(cx, cy, a, b, theta)
+
+                        plt.plot(x_outline, y_outline, 'b-', linewidth=1, alpha=0.3)
+
+                    optimized_motion_box = track.optimized_motion_box()
+                    history_motion_box = track.optimized_motion_box(history=True)
+
+                    if optimized_motion_box is not None:
+                        all_boxes.append(optimized_motion_box)
+                        all_labels.append(f"optimized_motion_box_{track.track_id}")
+                        all_box_types.append("optimized_motion_box")
+
+
+                    if history_motion_box is not None:
+                        all_boxes.append(history_motion_box)
+                        all_labels.append(f"history_motion_box_{track.track_id}")
+                        all_box_types.append("history_motion_box")
+
+                        box = history_motion_box
+                        center_xy = box[:2]
+                        length = box[3]
+                        width = box[4]
+                        yaw = box[6]
+
+                        # Get rotated box corners
+                        corners = get_rotated_box(center_xy, length, width, yaw)
+                        track_polygon = patches.Polygon(
+                            corners,
+                            linewidth=1,
+                            edgecolor="orange",
+                            facecolor="none",
+                            alpha=0.7,
+                            linestyle="dotted",
+                        )                        
+
+
+                    # for ellipse_params in track.predict_ellipse_motion_model(track.timestamps):
+                    #     cx, cy, cz, a, b, h, theta = ellipse_params
+
+                    #     x_outline, y_outline = draw_ellipse_outline(cx, cy, a, b, theta)
+
+                    #     plt.plot(x_outline, y_outline, 'g-', linewidth=2, alpha=0.5)
 
 
                 # if track.is_confirmed():
@@ -2291,7 +2450,7 @@ class OWLViTAlphaShapeMFCF:
                         linewidth=1,
                         edgecolor=color,
                         facecolor="none",
-                        alpha=1.0,
+                        alpha=0.5,
                     )
                     ax.add_patch(polygon)                    
 
@@ -2315,6 +2474,63 @@ class OWLViTAlphaShapeMFCF:
             save_path = save_folder / f"frame_{i}.png"
             plt.savefig(save_path, dpi=300, bbox_inches="tight")
             plt.close()
+
+            world_to_ego = np.linalg.inv(infos[i]['pose'])
+
+            all_boxes = np.stack(all_boxes, axis=0)
+            print("all_boxes", all_boxes.shape)
+            all_boxes = register_bbs(all_boxes, world_to_ego)
+
+            all_boxes = all_boxes.astype(float)
+
+            try:
+                all_boxes = torch.from_numpy(all_boxes)
+            except Exception as e: 
+                print("all_boxes", all_boxes)
+                raise e
+
+            if len(gt_lidar_boxes) > 0 and len(all_boxes) > 0:
+                ious = rotate_iou_cpu_eval(gt_lidar_boxes, all_boxes).reshape(
+                    gt_lidar_boxes.shape[0], all_boxes.shape[0], 2
+                )
+                ious = ious[:, :, 0]
+
+                idx = np.argmax(ious, axis=1)
+                votes = []
+                for i, j in enumerate(idx):
+                    if ious[i, j] > 0.1:
+                        gt_cat = gt_categories[i]
+                        print(f"GT {i} ({gt_cat}) matches with {all_labels[int(j)]} @ {ious[i, j]:.3f}")
+                        votes.append(all_box_types[j])
+
+                    for jj in range(len(all_boxes)):
+                        if jj == j:
+                            continue
+                        if ious[i, jj] > 0.1:
+                            print(f"    ALSO matches with {all_labels[int(jj)]} @ {ious[i, jj]:.3f}")
+
+                idx = np.argmax(ious, axis=0)
+                type_ious = {x: [] for x in set(all_box_types)}
+                for j, i in enumerate(idx):
+                    if ious[i, j] > 0.1: # only include those with some gt (e.g. we might find other objects)
+                        box_type = all_box_types[int(j)]
+                        type_ious[box_type].append(ious[i, j])
+
+                for box_type, box_type_ious in type_ious.items():
+                    box_type_ious = np.array(box_type_ious, float)
+                    if len(box_type_ious) > 0:
+                        print(f"Box type {box_type}: {box_type_ious.min():.3f} {box_type_ious.mean():.3f} {box_type_ious.max():.3f}")
+                    else:
+                        print(f"Box type {box_type} had no matches")
+
+                from collections import Counter
+                counter = Counter(votes)
+                print("best gt matches", counter.most_common(4))
+                
+            else:
+                print(f"{gt_lidar_boxes.shape=} {all_boxes.shape=}")
+
+            
 
             # image = np.zeros((2000, 2000, 3), dtype=np.uint8)
             # new_image = image.copy()

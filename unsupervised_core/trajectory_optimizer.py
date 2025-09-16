@@ -3,15 +3,104 @@ from pathlib import Path
 import gtsam
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.interpolate import UnivariateSpline, splev, splprep
+from scipy.interpolate import UnivariateSpline, splev, splprep, splrep
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 from sklearn.cluster import DBSCAN
 
+from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import box_iou_3d
 from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import wrap_angle
 
 from .box_utils import compute_ppscore, icp
+
+
+def create_spline_fitness_function(timestamps, poses, boxes, lwh, n_knots=5):
+    """
+    Create fitness function that optimizes spline coefficients instead of raw transforms
+    """
+    # Normalize timestamps to [0, 1] for better numerical stability
+    t_norm = (np.array(timestamps) - timestamps[0]) / (timestamps[-1] - timestamps[0])
+    
+    def spline_negative_iou_fitness(spline_coeffs):
+        """
+        spline_coeffs: flattened array of coefficients for 6 splines
+        Shape: [6 * n_knots] where each n_knots represents one spline
+        """
+        coeffs_reshaped = spline_coeffs.reshape(6, n_knots)
+        
+        total_iou = 0.0
+        for i, timestamp in enumerate(timestamps):
+            # Evaluate splines at this timestamp to get 6DOF parameters
+            t = t_norm[i]
+            
+            # Create spline for each parameter using coefficients
+            dx = evaluate_spline_from_coeffs(coeffs_reshaped[0], t, t_norm)
+            dy = evaluate_spline_from_coeffs(coeffs_reshaped[1], t, t_norm)
+            dz = evaluate_spline_from_coeffs(coeffs_reshaped[2], t, t_norm)
+            dyaw = evaluate_spline_from_coeffs(coeffs_reshaped[3], t, t_norm)
+            
+            # Apply transform and compute IoU
+            pose = poses[i]
+            yaw = wrap_angle(Rotation.from_matrix(pose[:3, :3]).as_rotvec()[2] + dyaw)
+            position = pose[:3, 3] + np.array([dx, dy, dz], pose.dtype)
+
+            cur_box = np.concatenate([position, lwh, yaw.reshape(1)])
+
+            # print("cur_box", cur_box)
+            # print("boxes[i]", boxes[i])
+            iou = box_iou_3d(cur_box, boxes[i])
+            
+            # refined_clusters = apply_transform(aligned_clusters[timestamp], transform)
+            # iou = compute_bev_convex_hull_iou(refined_clusters, reference_clusters[timestamp])
+            total_iou += iou
+        
+        # print("total_iou", total_iou)
+        return -total_iou / len(timestamps)
+    
+    return spline_negative_iou_fitness
+
+def compute_spline_poses(timestamps, poses, spline_coeffs, n_knots):
+    # Normalize timestamps to [0, 1] for better numerical stability
+    t_norm = (np.array(timestamps) - timestamps[0]) / (timestamps[-1] - timestamps[0])
+    
+    new_poses = []
+
+    coeffs_reshaped = spline_coeffs.reshape(6, n_knots)
+    
+    for i, timestamp in enumerate(timestamps):
+        # Evaluate splines at this timestamp to get 6DOF parameters
+        t = t_norm[i]
+        
+        # Create spline for each parameter using coefficients
+        dx = evaluate_spline_from_coeffs(coeffs_reshaped[0], t, t_norm)
+        dy = evaluate_spline_from_coeffs(coeffs_reshaped[1], t, t_norm)
+        dz = evaluate_spline_from_coeffs(coeffs_reshaped[2], t, t_norm)
+        dyaw = evaluate_spline_from_coeffs(coeffs_reshaped[3], t, t_norm)
+        
+        # Apply transform and compute IoU
+        pose = poses[i]
+        yaw = wrap_angle(Rotation.from_matrix(pose[:3, :3]).as_rotvec()[2] + dyaw)
+        position = pose[:3, 3] + np.array([dx, dy, dz], pose.dtype)
+
+        pose = np.eye(4)
+        pose[:3, :3] = Rotation.from_rotvec(np.array([0, 0, yaw], float)).as_matrix()
+        pose[:3, 3] = position
+
+        new_poses.append(pose)
+
+    return new_poses
+
+def evaluate_spline_from_coeffs(coeffs, t_eval, t_knots):
+    """
+    Evaluate spline at t_eval using control point coefficients
+    """
+    # Create knot vector (uniform spacing)
+    knots = np.linspace(0, 1, len(coeffs))
+    
+    # Use UnivariateSpline with these coefficients
+    spline = UnivariateSpline(knots, coeffs, s=0, k=min(3, len(coeffs)-1))
+    return spline(t_eval)
 
 
 def smooth_trajectory_with_vehicle_model(timestamps_ns, optimized_poses, 
