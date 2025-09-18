@@ -5,7 +5,13 @@ from typing import Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
-from scipy.interpolate import UnivariateSpline, splev, splprep
+from scipy.interpolate import (
+    LSQUnivariateSpline,
+    UnivariateSpline,
+    make_interp_spline,
+    splev,
+    splprep,
+)
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
@@ -63,6 +69,142 @@ class ConvexHullTrackState:
     Confirmed = 2
     Deleted = 3
 
+class BoxPredictor:
+    init_timestamp_sec: int
+    heading_speed_thresh_ms: float
+    coefficients: np.ndarray
+
+    def __init__(self, heading_speed_thresh_ms: float = 3.6) -> None:
+        self.heading_speed_thresh_ms = heading_speed_thresh_ms
+
+        self.coefficients = np.zeros((3, 7), float)
+        self.init_timestamp_sec = 0 # placeholder..
+
+    def update(self, timestamps: List[int], boxes: List[np.ndarray]) -> None:
+        # Prepare data
+        init_timestamp_sec = min(timestamps) * NANOSEC_TO_SEC
+        self.init_timestamp_sec = init_timestamp_sec
+        time_offsets = np.array(timestamps, dtype=np.float64) * NANOSEC_TO_SEC - init_timestamp_sec
+        
+        measurements = np.stack(boxes, axis=0)
+        
+        lwhs = measurements[:, 3:6]
+        measurements[:, 3:6] = np.mean(lwhs, axis=0).reshape(1, 3).repeat(len(measurements), 0)
+        positions = measurements[:, :3]
+        
+        if len(time_offsets) >= 4:
+            # Extract positions and yaws
+            positions = measurements[:, :3]
+            original_yaws = measurements[:, 6]
+            
+            n_points = len(positions)
+            
+            # Base smoothing on path length and noise level
+            path_length = np.sum(np.linalg.norm(np.diff(positions[:, :2], axis=0), axis=1))
+            smoothing_factor = max(n_points * 0.1, path_length * 0.01)
+            
+            
+            # Parametric spline for XY path
+            tck_xy, u_xy = splprep([positions[:, 0], positions[:, 1]], 
+                                u=time_offsets, s=smoothing_factor, k=min(3, n_points-1))
+            
+            # Smooth Z separately
+            z_spline = UnivariateSpline(time_offsets, positions[:, 2], 
+                                    s=smoothing_factor * 0.5, k=min(3, n_points-1))
+            
+            # Evaluate smoothed path
+            smoothed_xy = np.array(splev(time_offsets, tck_xy)).T
+            smoothed_z = z_spline(time_offsets)
+            smoothed_positions = np.column_stack([smoothed_xy, smoothed_z])
+            measurements[:, :3] = smoothed_positions
+            
+            # Step 2: Compute velocities and speeds from smoothed path
+            xy_derivatives = np.array(splev(time_offsets, tck_xy, der=1)).T
+            z_derivative = z_spline.derivative()(time_offsets)
+            
+            velocities_3d = np.column_stack([xy_derivatives, z_derivative])
+            speeds_2d = np.linalg.norm(xy_derivatives, axis=1)
+            
+            # Step 3: Derive yaw from path tangents (when moving fast enough)
+            path_yaws = np.arctan2(xy_derivatives[:, 1], xy_derivatives[:, 0])
+            
+            # Determine which frames to use path-based yaw vs original yaw
+            use_path_yaw = speeds_2d > self.heading_speed_thresh_ms
+            n_fast_frames = np.sum(use_path_yaw)
+            
+            # Initialize output yaws
+            smoothed_yaws = original_yaws.copy()
+            
+            if n_fast_frames > 0:
+                # For fast frames, use path tangent yaw
+                # Handle angle wrapping carefully
+                fast_indices = np.where(use_path_yaw)[0]
+
+                fps = path_yaws[fast_indices]
+                xps = time_offsets[fast_indices]
+                smoothed_yaws = np.interp(time_offsets, xps, fps)
+            else:
+                median_yaw = np.median(original_yaws)
+                smoothed_yaws[:] = median_yaw
+            
+            measurements[:, 6] = smoothed_yaws
+        else:
+            # Calculate velocities and speeds
+            dt = np.diff(time_offsets)
+            velocities = np.diff(positions, axis=0) / dt[:, np.newaxis]
+            speeds = np.linalg.norm(velocities[:, :2], axis=1)
+
+            path_yaws = np.arctan2(velocities[:, 1], velocities[:, 0])
+
+            use_path_yaw = speeds > self.heading_speed_thresh_ms
+            n_fast_frames = np.sum(use_path_yaw)
+
+            if n_fast_frames > 0:
+                fast_indices = np.where(use_path_yaw)[0]
+
+                fps = path_yaws[fast_indices]
+                xps = time_offsets[fast_indices]
+                yaws = np.interp(time_offsets, xps, fps)
+            else:
+                # yaws = np.median(measurements[:, 6]).reshape(1).repeat(len(measurements))
+
+                directions = np.stack([np.cos(measurements[:, 6]), np.sin(measurements[:, 6])], axis=1)
+
+                primary_direction = np.mean(directions, axis=0)
+
+                primary_yaw = np.arctan2(primary_direction[1], primary_direction[0])
+                yaws = primary_yaw.reshape(1).repeat(len(measurements))
+
+
+            measurements[:, 6] = yaws[:len(measurements)]
+        
+        # Fit model
+        A = np.column_stack([
+            np.ones(len(time_offsets)),
+            time_offsets,
+            0.5 * time_offsets**2
+        ])
+
+        self.coefficients, residuals, *_ = np.linalg.lstsq(A, measurements, rcond=None)
+        
+        # Evaluate
+        predictions = self.predict_boxes(timestamps)
+        # errs = (measurements - predictions)
+        r2 = r2_score(measurements, predictions, multioutput='uniform_average')
+        rmse = mean_squared_error(measurements, predictions, multioutput='uniform_average')
+        print(f"Box Parameter Update - R²: {r2:.3f} - rmse {rmse:.3f}")
+
+    def predict_boxes(self, new_timestamps: List[int]) -> np.ndarray:
+        new_timestamps = np.array(new_timestamps, float) * NANOSEC_TO_SEC - self.init_timestamp_sec 
+        new_timestamps = new_timestamps.reshape(-1, 1)
+
+        coeff1 = self.coefficients[0].copy().reshape(1, 7)
+        coeff2 = self.coefficients[1].copy().reshape(1, 7)
+        coeff3 = self.coefficients[2].copy().reshape(1, 7)
+
+        predictions = (coeff1 + coeff2 * new_timestamps + 0.5 * coeff3 * new_timestamps**2)
+
+        return predictions
 
 class ConvexHullTrack:
     def __init__(self, mean, covariance, track_id, n_init, max_age,
@@ -112,6 +254,7 @@ class ConvexHullTrack:
 
         self.positions = []
         self.positions.append(mean[:3])
+        self.flow_positions = []
 
         # final after global optimization
         self.initial_poses = None
@@ -126,10 +269,15 @@ class ConvexHullTrack:
 
         self.source = convex_hull.source
 
+
         
         self.icp_max_iterations = 5
         self.icp_max_cost = 0.3
         self.heading_speed_thresh_ms = 3.6 # m/s
+
+        self.optimized_box_predictor = BoxPredictor(self.heading_speed_thresh_ms)
+        self.history_box_predictor = BoxPredictor(self.heading_speed_thresh_ms)
+        # self.ellipse_box_predictor = BoxPredictor(self.heading_speed_thresh_ms)
 
         self._n_init = n_init
         self._max_age = max_age
@@ -141,72 +289,30 @@ class ConvexHullTrack:
         self.icp_cache = {}
 
     def extrapolate_box(self, timestamps):
-        init_timestamp_sec = min(self.timestamps) * NANOSEC_TO_SEC
-
-        A = self.A
-        c = self.c
-
-        time_offsets = np.array(timestamps, dtype=np.float64) * NANOSEC_TO_SEC - init_timestamp_sec
-        new_prediction = A[np.newaxis, :] * time_offsets[:, np.newaxis] + c[np.newaxis, :]
+        new_prediction = self.history_box_predictor.predict_boxes(timestamps)
 
         return new_prediction.reshape(-1, 7)
 
-    # def extrapolate_box(self, timestamps):
-
-    #     boxes = self.predict_ellipse_motion_model(timestamps)
-
-    #     boxes[:, 3:5] *= 2
-
-    #     assert boxes[:, 3:5].shape[1] == 2
-
-    #     return boxes
-
     def optimized_motion_box(self, history=False):
-        times_secs = np.array(self.timestamps, dtype=np.float64) * NANOSEC_TO_SEC
-        time_offsets = times_secs - times_secs[0]  # Make relative to first timestamp
-        
-        if len(times_secs) < 3:
+        if len(self.timestamps) < 3:
             return None
 
         try:
-            A = np.column_stack([
-                np.ones(len(time_offsets)),
-                time_offsets,
-                0.5 * time_offsets**2
-            ])
-
             if not history:
-                measurements = np.stack(self.optimized_boxes, axis=0)
+                prediction = self.optimized_box_predictor.predict_boxes([self.last_predict_timestamp])[0]
             else:
-                measurements = np.stack([obj.box for obj in self.history], axis=0)
-
-            coeffs = np.linalg.lstsq(A, measurements, rcond=None)[0]  # [p0, v0, a] for each dimension
-
-            t = self.last_predict_timestamp * NANOSEC_TO_SEC - times_secs[0]
-            prediction = (coeffs[0] + coeffs[1] * t + 0.5 * coeffs[2] * t**2)
+                prediction = self.history_box_predictor.predict_boxes([self.last_predict_timestamp])[0]
 
             return prediction
         except Exception as e:
             print(f"optimized_motion_box: {e}")
             return None
 
-
-    def to_box(self):
-        A = self.A
-        c = self.c
-
-        timestamp = self.last_predict_timestamp
-        init_timestamp = min(self.timestamps)*NANOSEC_TO_SEC
-
-        new_timestamps = np.array([timestamp*NANOSEC_TO_SEC - init_timestamp], float)
-        new_prediction = A[np.newaxis, :] * new_timestamps[:, np.newaxis] + c[np.newaxis, :]
-
-        return new_prediction.reshape(7)
-
     def to_box(self):
         optimized_box = self.optimized_motion_box()
 
         if optimized_box is None:
+            # dumb fallback...
             A = self.A
             c = self.c
 
@@ -220,63 +326,12 @@ class ConvexHullTrack:
         else:
             return optimized_box
 
-    # def to_box(self):
-    #     # return self.optimized_boxes[-1] # last seen box...
-    #     # return self.extrapolate_box([self.last_predict_timestamp])[0]
-
-    #     cx, cy, cz, a, b, h, theta = self.predict_ellipse_motion_model([self.last_predict_timestamp])[0]
-
-    #     # length is diameter whilst a,b  are radius / semi-axis
-    #     l = 2*a
-    #     w = 2*b
-
-    #     box = np.array([cx, cy, cz, l, w, h, theta], np.float32)
-
-    #     return box
-
-    # def to_box(self):
-    #     assert len(self.mean) == 12
-
-    #     centre = self.mean[:3]
-    #     yaw = self.mean[5]
-    #     # yaw = self.yaw
-
-    #     # if abs(self.mean[5] - self.yaw) > 0.4:
-    #     #     print(f"{self.yaw=:.3f} {self.mean[5]=:.3} {self.hits=} {self.age=} {self.yaw_method=}") 
-
-    #     x, y, z = centre
-    #     l, w, h = self.lwh
-
-    #     # box = np.concatenate([centre.reshape(3), lwh.reshape(3), ry.reshape(1)], axis=0)
-    #     box = np.array([x, y, z, l, w, h, yaw], dtype=np.float32)
-
-    #     return box
-
     def extrapolate_ellipse_box(self, timestamps: List[int]):
         boxes = self.predict_ellipse_motion_model([self.last_predict_timestamp])
 
         boxes[:, 3:5] *= 2
 
         return boxes
-
-    def extrapolate_kalman_box(self, timestamp: int):
-        dt = (timestamp - self.timestamps[-1]) * NANOSEC_TO_SEC
-        
-        ndim = 6
-        self._motion_mat = np.eye(2 * ndim, 2 * ndim)
-        for i in range(ndim):
-            self._motion_mat[i, ndim + i] = dt
-
-        new_mean = np.dot(self._motion_mat, self.mean.copy())
-
-        centre = new_mean[:3]
-        yaw = new_mean[5]
-        x, y, z = centre
-        l, w, h = self.lwh
-
-        box = np.array([x, y, z, l, w, h, yaw], dtype=np.float32)
-
-        return box
 
     def to_points(self):
         # return self.last_points
@@ -340,22 +395,18 @@ class ConvexHullTrack:
         self.age += 1
         self.time_since_update += 1
 
-        pos = self.extrapolate_box([timestamp])[0][:3]
-
-        self.positions.append(pos)
-
     def get_or_compute_relative_pose(self, points_i, points_j, center, cache_key):
         if cache_key in self.icp_cache:
-            R_cached, t_cached, cost, iou, center_old = self.icp_cache[cache_key]
+            R_cached, t_cached, cost, iou, inliersi, inliersj, center_old = self.icp_cache[cache_key]
             # Transform translation for new center
             delta = center_old - center
             t_new = t_cached + (np.eye(3) - R_cached) @ delta
-            return R_cached, t_new, cost, iou
+            return R_cached, t_new, cost, iou, inliersi, inliersj
         
         # Compute and cache
         centered_i = points_i - center
         centered_j = points_j - center
-        R, t, inliers, _, cost = relative_object_pose(centered_i, centered_j)
+        R, t, inliersi, inliersj, cost = relative_object_pose(centered_i, centered_j)
 
         shape1_points = (R @ centered_i.copy().T).T + t
         shape2_points = centered_j
@@ -402,16 +453,57 @@ class ConvexHullTrack:
 
         iou = bev_iou * z_iou
 
-        self.icp_cache[cache_key] = (R, t, cost, iou, center.copy())
-        return R, t, cost, iou
+        self.icp_cache[cache_key] = (R, t, cost, iou, inliersi, inliersj, center.copy())
+        return R, t, cost, iou, inliersi, inliersj
+
+
+    def get_or_compute_relative_pose_flow(self, points_i, flow_i, center, cache_key):
+        if cache_key in self.icp_cache:
+            R_cached, t_cached, center_old = self.icp_cache[cache_key]
+            # Transform translation for new center
+            delta = center_old - center
+            t_new = t_cached + (np.eye(3) - R_cached) @ delta
+            return R_cached, t_new
+        
+        # Compute and cache
+        mean_flow = np.mean(flow_i, axis=0)
+        A = points_i - center
+        B = A + flow_i - mean_flow
+
+        # Cross-covariance matrix for 2D
+        H = A[:, :2].T @ B[:, :2]
+        
+        # SVD for 2D rotation
+        U, S, Vt = np.linalg.svd(H)
+        R_2d = Vt.T @ U.T
+        
+        # Ensure proper rotation
+        if np.linalg.det(R_2d) < 0:
+            Vt[-1, :] *= -1
+            R_2d = Vt.T @ U.T
+        
+        # Extend to 3D
+        R_flow = np.eye(3)
+        R_flow[:2, :2] = R_2d
+        
+        # Translation
+        t_flow = np.zeros(3)
+        t_flow[:3] = mean_flow
+
+        self.icp_cache[cache_key] = (R_flow, t_flow, center.copy())
+        return R_flow, t_flow
 
     def compute_poses(self):
         timestamps = self.timestamps
         n_frames = len(timestamps)
 
         points_list = []
+        flow_list = []
         boxes = self.extrapolate_box(timestamps)
-        initial_poses = []
+        # boxes = self.predict_ellipse_motion_model(timestamps)
+        # boxes[:, 3:5] *= 2
+
+        # boxes = np.array([x.box for x in self.history])
 
         # use initial pose as reference
         ref_pose_vector = PoseKalmanFilter.box_to_pose_vector(boxes[0])
@@ -423,136 +515,205 @@ class ConvexHullTrack:
         last_yaw = ref_pose_vector[3].copy()
         initial_yaw = ref_pose_vector[3].copy()
         last_velocity = np.zeros(3)
-        last_angular_velocity = 0
 
         # Collect world points and centers
         for i, timestamp_ns in enumerate(timestamps):
             obj: ConvexHullObject = self.history[i]
             world_points = obj.original_points
 
-            # add our pose here
-            pose_vector = PoseKalmanFilter.box_to_pose_vector(boxes[i])
-            pose_matrix = PoseKalmanFilter.pose_vector_to_transform(pose_vector)
-            initial_poses.append(pose_matrix)
             points_list.append(world_points)
+            flow_list.append(obj.flow)
 
         optimized_poses = [ref_pose_matrix]
 
         last_optimized_yaw = np.copy(last_yaw)
         last_optimized_position = np.copy(last_position)
 
-        constraints = []
-        for i in range(1, n_frames):
-            # rel_R, rel_pos, A_inliers, B_inliers, icp_cost_rel = relative_object_pose(centered_ref, centered_curr1)
-            R_rel, t_rel, icp_cost_rel, iou_rel = self.get_or_compute_relative_pose(
-                points_list[i-1], points_list[i], 
-                last_optimized_position,
-                (i-1, i, 'relative')
-            )
-    
-            rel_yaw = Rotation.from_matrix(R_rel).as_rotvec()[2]
-            rel_yaw_guess = wrap_angle(last_optimized_yaw + rel_yaw)
+        flow_positions = [last_optimized_position]
 
-            if i == 1:
-                R_init, t_init, icp_cost_initial, iou_initial = R_rel, t_rel, icp_cost_rel, iou_rel
-            else:
-                R_init, t_init, icp_cost_initial, iou_initial = self.get_or_compute_relative_pose(
-                    points_list[0], points_list[i], 
-                    initial_position,
-                    (0, i, 'initial')
-                )
+        for i in range(n_frames):
+            R_flow, t_flow = self.get_or_compute_relative_pose_flow(points_list[i], flow_list[i], last_optimized_position, (i, i+1))
 
-            initial_yaw_guess = wrap_angle(initial_yaw + Rotation.from_matrix(R_init).as_rotvec()[2])
+            flow_yaw = Rotation.from_matrix(R_flow).as_rotvec()[2]
+            flow_positions.append(last_optimized_position + t_flow)
 
-            # pose guesses
-            rel_pos_guess = last_optimized_position + t_rel
-            initial_pos_guess = initial_position + t_init
-
-            # Compute current velocities
-            dt = (timestamps[i] - timestamps[i-1]) * 1e-9
-            velocity_rel = (rel_pos_guess - last_optimized_position) / dt
-            velocity_init = (initial_pos_guess - last_optimized_position) / dt
-
-            # Smoothness penalties
-            lambda_smooth = 0.1  # Tunable parameter
-            smooth_cost_rel = lambda_smooth * np.linalg.norm(velocity_rel - last_velocity)**2 
-            smooth_cost_init = lambda_smooth * np.linalg.norm(velocity_init - last_velocity)**2
-
-            iou_cost_rel = (1.0 - iou_rel)
-            iou_cost_initial = (1.0 - iou_initial)
-
-            # weight between the two
-            total_cost_rel = icp_cost_rel + smooth_cost_rel + iou_cost_rel
-            total_cost_init = icp_cost_initial + smooth_cost_init + iou_cost_initial
-            weight_rel = 1.0 / (total_cost_rel + 1e-6)
-            weight_initial = 1.0 / (total_cost_init + 1e-6)
-
-            total_weight = weight_rel + weight_initial
-            weight_rel /= total_weight
-            weight_initial /= total_weight
-
-            print(f"{weight_rel=} {weight_initial=}")
-
-            optimized_position = rel_pos_guess * weight_rel + initial_pos_guess * weight_initial
-            optimized_yaw = circular_weighted_mean(
-                np.array([rel_yaw_guess, initial_yaw_guess]), 
-                np.array([weight_rel, weight_initial])
-            )
-
-            velocity = (optimized_position - last_optimized_position) / dt
-            speed = np.linalg.norm(velocity[:2])
-
-            if speed < self.heading_speed_thresh_ms:
-                optimized_yaw = last_optimized_yaw
-
+            optimized_position = last_optimized_position + t_flow
+            optimized_yaw = wrap_angle(last_optimized_yaw + flow_yaw)
 
             pose = np.eye(4)
             pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, optimized_yaw], float)).as_matrix()
             pose[:3, 3] = optimized_position
             optimized_poses.append(pose)
 
-            # Update for next iteration
-            last_velocity = (optimized_position - last_optimized_position) / dt
-            last_angular_velocity = (optimized_yaw - last_optimized_yaw) / dt
-
             last_optimized_position = np.copy(optimized_position)
             last_optimized_yaw = np.copy(optimized_yaw)
 
-        # smoothing to fix icp accumulated errors
-        optimized_poses = smooth_trajectory_with_vehicle_model(self.timestamps, optimized_poses, heading_speed_thresh=self.heading_speed_thresh_ms)
+        # spline_poses = compute_spline_poses(self.timestamps, optimized_poses)
+        # spline_vecs = np.stack([PoseKalmanFilter.transform_to_pose_vector(x) for x in spline_poses], axis=0)
+        # orig = np.stack([PoseKalmanFilter.transform_to_pose_vector(x) for x in optimized_poses], axis=0)
 
-        # Usage with CMA-ES
-        total_time_secs = (max(self.timestamps) - min(self.timestamps)) * NANOSEC_TO_SEC
-        n_knots = max(2, int(total_time_secs))  # every second?
-        print("n_knots", n_knots)
-        n_params = 6 * n_knots  # 6 splines × n_knots each
+        # for i in range(1, n_frames):
+        #     R_rel, t_rel, icp_cost_rel, iou_rel, _, _ = self.get_or_compute_relative_pose(
+        #         points_list[i-1], points_list[i], 
+        #         last_optimized_position,
+        #         (i-1, i)
+        #     )
+    
+        #     rel_yaw = Rotation.from_matrix(R_rel).as_rotvec()[2]
+        #     rel_yaw_guess = wrap_angle(last_optimized_yaw + rel_yaw)
 
-        fitness_func = create_spline_fitness_function(timestamps, optimized_poses, boxes, self.lwh, n_knots)
+        #     if i == 1:
+        #         R_init, t_init, icp_cost_initial, iou_initial = R_rel, t_rel, icp_cost_rel, iou_rel
+        #     else:
+        #         R_init, t_init, icp_cost_initial, iou_initial, _, _ = self.get_or_compute_relative_pose(
+        #             points_list[0], points_list[i], 
+        #             initial_position,
+        #             (0, i)
+        #         )
 
-        # Initialize with small random coefficients (smooth trajectories)
-        initial_guess = np.random.normal(0, 0.05, n_params)
-        sigma = 0.2
+        #     mean_flow = np.mean(flow_list[i], axis=0)
+        #     A = points_list[i] - last_optimized_position
+        #     B = A + flow_list[i] - mean_flow
 
-        import cma
+        #     # Cross-covariance matrix for 2D
+        #     H = A[:, :2].T @ B[:, :2]
+            
+        #     # SVD for 2D rotation
+        #     U, S, Vt = np.linalg.svd(H)
+        #     R_2d = Vt.T @ U.T
+            
+        #     # Ensure proper rotation
+        #     if np.linalg.det(R_2d) < 0:
+        #         Vt[-1, :] *= -1
+        #         R_2d = Vt.T @ U.T
+            
+        #     # Extend to 3D
+        #     R_flow = np.eye(3)
+        #     R_flow[:2, :2] = R_2d
+            
+        #     # Translation
+        #     t_flow = np.zeros(3)
+        #     t_flow[:3] = mean_flow
 
-        es = cma.CMAEvolutionStrategy(initial_guess, sigma)
-        es.optimize(fitness_func, iterations=50, maxfun=50)
+        #     flow_yaw = Rotation.from_matrix(R_flow).as_rotvec()[2]
 
-        print("result", es.result)
-        xbest = es.result.xbest
+        #     print("flow_yaw", flow_yaw, "t_flow", t_flow)
+        #     print("rel_yaw_guess", rel_yaw_guess, "t_rel", t_rel)
 
-        self.spline_poses = compute_spline_poses(self.timestamps, optimized_poses, xbest, n_knots)
+        #     flow_positions.append(last_optimized_position + t_flow)
+
+        #     initial_yaw_guess = wrap_angle(initial_yaw + Rotation.from_matrix(R_init).as_rotvec()[2])
+
+        #     # pose guesses
+        #     rel_pos_guess = last_optimized_position + t_rel
+        #     initial_pos_guess = initial_position + t_init
+
+        #     # compute boxes for each
+        #     box_rel = np.concatenate([rel_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), rel_yaw_guess.reshape(1)], axis=0)
+        #     box_init = np.concatenate([initial_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), initial_yaw_guess.reshape(1)], axis=0)
+        #     orig_box = boxes[i]
+
+        #     box_mask_rel = ConvexHullObject.points_in_box(box_rel, points_list[i], ret_mask=True)
+        #     box_mask_init = ConvexHullObject.points_in_box(box_init, points_list[i], ret_mask=True)
+        #     box_mask_orig = ConvexHullObject.points_in_box(orig_box, points_list[i], ret_mask=True)
+
+        #     box_iou_rel = box_mask_rel.sum() / box_mask_rel.size
+        #     box_iou_init = box_mask_init.sum() / box_mask_rel.size
+        #     box_iou_orig = box_mask_orig.sum() / box_mask_rel.size
+
+        #     # Compute current velocities
+        #     dt = (timestamps[i] - timestamps[i-1]) * 1e-9
+        #     velocity_rel = (rel_pos_guess - last_optimized_position) / dt
+        #     velocity_init = (initial_pos_guess - last_optimized_position) / dt
+        #     velocity_box = (orig_box[:3] - last_optimized_position) / dt
+
+        #     # Smoothness penalties
+        #     lambda_smooth = 0.1  # Tunable parameter
+        #     smooth_cost_rel = lambda_smooth * np.linalg.norm(velocity_rel - last_velocity)**2 
+        #     smooth_cost_init = lambda_smooth * np.linalg.norm(velocity_init - last_velocity)**2
+        #     smooth_cost_orig = lambda_smooth * np.linalg.norm(velocity_box - last_velocity)**2
+
+        #     # iou_cost_rel = (1.0 - iou_rel)
+        #     # iou_cost_initial = (1.0 - iou_initial)
+
+
+        #     # weight between the two
+        #     # total_cost_rel = icp_cost_rel + smooth_cost_rel + iou_cost_rel
+        #     # total_cost_init = icp_cost_initial + smooth_cost_init + iou_cost_initial
+        #     total_cost_rel = (1.0 - box_iou_rel) + smooth_cost_rel
+        #     total_cost_init = (1.0 - box_iou_init) + smooth_cost_init
+        #     total_cost_orig = (1.0 - box_iou_orig) + smooth_cost_orig
+
+        #     weight_rel = 1.0 / (total_cost_rel + 1e-6)
+        #     weight_initial = 1.0 / (total_cost_init + 1e-6)
+        #     weight_orig = 1.0 / (total_cost_orig + 1e-6)
+
+        #     total_weight = weight_rel + weight_initial + weight_orig
+        #     weight_rel /= total_weight
+        #     weight_initial /= total_weight
+        #     weight_orig /= total_weight
+
+        #     print(f"{float(weight_rel)=} {float(weight_initial)=} {float(weight_orig)=}")
+
+        #     optimized_position = rel_pos_guess * weight_rel + initial_pos_guess * weight_initial + orig_box[:3] * weight_orig
+        #     optimized_yaw = circular_weighted_mean(
+        #         np.array([rel_yaw_guess, initial_yaw_guess, orig_box[6]]), 
+        #         np.array([weight_rel, weight_initial, weight_orig])
+        #     )
+
+        #     velocity = (optimized_position - last_optimized_position) / dt
+        #     speed = np.linalg.norm(velocity[:2])
+
+        #     if speed < self.heading_speed_thresh_ms:
+        #         optimized_yaw = last_optimized_yaw
+
+        #     pose = np.eye(4)
+        #     pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, optimized_yaw], float)).as_matrix()
+        #     pose[:3, 3] = optimized_position
+        #     optimized_poses.append(pose)
+
+        #     # Update for next iteration
+        #     last_velocity = (optimized_position - last_optimized_position) / dt
+        #     last_angular_velocity = (optimized_yaw - last_optimized_yaw) / dt
+
+        #     last_optimized_position = np.copy(optimized_position)
+        #     last_optimized_yaw = np.copy(optimized_yaw)
 
         self.optimized_poses = optimized_poses
 
+        self.positions = [x[:3, 3].copy() for x in optimized_poses]
+        self.flow_positions = flow_positions
+
+        # update points
+        # Now transform points to object-centric coordinates
+        object_centric_points = []
         optimized_boxes = []
         spline_boxes = []
-        for i in range(n_frames):
-            world_points = self.history[i].mesh.vertices
+        # inlier_tallies = [np.zeros((len(x.original_points),), int) for x in self.history]
+        # for i in range(1, n_frames):
+        #     _, _, _, _, inliersi, inliersj, _ = self.icp_cache[(i-1, i)]
+
+        #     inlier_tallies[i-1][inliersi] += 1
+        #     inlier_tallies[i][inliersj] += 1
+
+        # inlier_indices_list = []
+        # for i in range(n_frames):
+        #     cur_tallies = inlier_tallies[i]
+        #     inlier_indices = np.where(cur_tallies > 0)[0]
+        #     # print(f"Frame {i} inliers {cur_tallies.min()} {cur_tallies.mean()} {cur_tallies.max()} {cur_tallies.shape=}")
+        #     inlier_indices_list.append(inlier_indices)
+
+        # for convex_hull_obj, obj_pose, inlier_indices in zip(self.history, optimized_poses, inlier_indices_list):
+        for convex_hull_obj, obj_pose in zip(self.history, optimized_poses):
+            # Get world points
+            # world_points = convex_hull_obj.original_points[inlier_indices]
+            world_points = convex_hull_obj.original_points
 
             # Transform to object-centric: multiply by inverse of object pose
-            world_to_object = np.linalg.inv(optimized_poses[i])
+            world_to_object = np.linalg.inv(obj_pose)
             object_points = points_rigid_transform(world_points, world_to_object)
+
+            object_centric_points.append(object_points)
 
             dims_mins, dims_maxes = object_points.min(axis=0), object_points.max(axis=0)
             l, w, h = dims_maxes - dims_mins
@@ -562,34 +723,7 @@ class ConvexHullTrack:
             box = np.array([x, y, z, l, w, h, yaw])
             optimized_boxes.append(box)
 
-            # Transform to object-centric: multiply by inverse of object pose
-            world_to_object = np.linalg.inv(self.spline_poses[i])
-            object_points = points_rigid_transform(world_points, world_to_object)
-
-            dims_mins, dims_maxes = object_points.min(axis=0), object_points.max(axis=0)
-            l, w, h = dims_maxes - dims_mins
-
-            yaw = Rotation.from_matrix(self.spline_poses[i][:3, :3]).as_rotvec()[2]
-            x, y, z = self.spline_poses[i][:3, 3]
-            box = np.array([x, y, z, l, w, h, yaw])
-            spline_boxes.append(box)
-
-        self.spline_boxes = spline_boxes
         self.optimized_boxes = optimized_boxes
-
-        # update points
-        # Now transform points to object-centric coordinates
-        object_centric_points = []
-
-        for convex_hull_obj, obj_pose in zip(self.history, optimized_poses):
-            # Get world points
-            world_points = convex_hull_obj.original_points
-
-            # Transform to object-centric: multiply by inverse of object pose
-            world_to_object = np.linalg.inv(obj_pose)
-            object_points = points_rigid_transform(world_points, world_to_object)
-
-            object_centric_points.append(object_points)
 
         self.object_points = np.concatenate(object_centric_points, axis=0)
         self.object_points = voxel_sampling_fast(self.object_points, 0.05, 0.05, 0.05)
@@ -688,34 +822,6 @@ class ConvexHullTrack:
             [centre_rotated[0], centre_rotated[1], centre_z, length, width, height, yaw]
         )
 
-    def sync_kalman_with_gtsam(self, kf, confidence_factor=0.7):
-        if len(self.optimized_poses) < 2:
-            return
-            
-        # Estimate 4D velocity from pose trajectory
-        latest_pose = self.optimized_poses[-1] 
-        prev_pose = self.optimized_poses[-2]
-        dt = (self.timestamps[-1] - self.timestamps[-2]) * NANOSEC_TO_SEC
-        
-        # Linear velocities
-        vx, vy, vz = (latest_pose[:3, 3] - prev_pose[:3, 3]) / dt
-        
-        # Angular velocity (handle wraparound)
-        yaw_curr = np.arctan2(latest_pose[1, 0], latest_pose[0, 0])
-        yaw_prev = np.arctan2(prev_pose[1, 0], prev_pose[0, 0]) 
-        vyaw = wrap_angle(yaw_curr - yaw_prev) / dt
-
-        # Update Kalman state
-        pose_vector = [latest_pose[0, 3], latest_pose[1, 3], latest_pose[2, 3], yaw_curr]
-        velocity_vector = [vx, vy, vz, vyaw]
-        
-        gtsam_mean = np.concatenate([pose_vector, velocity_vector])
-        self.mean = confidence_factor * gtsam_mean + (1 - confidence_factor) * self.mean
-        self.mean[3] = wrap_angle(self.mean[3])  # Ensure yaw is wrapped
-
-        print("sync_kalman_with_gtsam updated mean", self.mean[:4])
-        box = self.extrapolate_box([self.last_predict_timestamp])[0]
-        print("latest prediction from", box)
 
     def _create_pose_from_heading(self, position, heading_vector):
         """Create a pose matrix with given position and heading direction."""
@@ -846,11 +952,6 @@ class ConvexHullTrack:
 
         self.mark_hit()
 
-        # # After every few measurements, sync with GTSAM
-        # if len(self.history) >= 3 and len(self.history) % 3 == 0:
-        #     self.optimized_poses = self.compute_poses()
-
-            # self.sync_kalman_with_gtsam(kf, confidence_factor=0.5)
         self.optimized_poses = self.compute_poses()
 
         self.prev_pose = self.to_pose_matrix()
@@ -859,6 +960,9 @@ class ConvexHullTrack:
         # self.update_box_parameters_weighted_lstsq()
         # self.update_box_parameters_dual_fit()
         self.update_ellipse_with_motion_constraints()
+        self.history_box_predictor.update(self.timestamps, [x.box for x in self.history])
+        if self.optimized_boxes is not None:
+            self.optimized_box_predictor.update(self.timestamps, self.optimized_boxes)
 
     def update_ellipse_with_motion_constraints(self):
         """Use vehicle motion model constraints"""
@@ -946,30 +1050,25 @@ class ConvexHullTrack:
             dt = np.diff(time_offsets)
             velocities = np.diff(positions, axis=0) / dt[:, np.newaxis]
             speeds = np.linalg.norm(velocities[:, :2], axis=1)
-            
-            # Calculate yaws from velocity
-            velocity_yaws = np.arctan2(velocities[:, 1], velocities[:, 0])
-            
-            avg_speed = np.mean(speeds)
 
-            if avg_speed > self.heading_speed_thresh_ms:
-                yaws = velocity_yaws
-                yaws = np.concatenate([yaws, yaws[[-1]]], axis=0)
+            use_path_yaw = speeds > self.heading_speed_thresh_ms
+            n_fast_frames = np.sum(use_path_yaw)
+
+            path_yaws = np.arctan2(velocities[:, 1], velocities[:, 0])
+
+            if n_fast_frames > 0:
+                fast_indices = np.where(use_path_yaw)[0]
+
+                fps = path_yaws[fast_indices]
+                xps = time_offsets[fast_indices]
+                yaws = np.interp(time_offsets, xps, fps)
             else:
-                # yaws = np.mean(measurements[:, 6]).reshape(1).repeat(len(measurements))
+                # yaws = np.median(measurements[:, 6]).reshape(1).repeat(len(measurements))
 
                 directions = np.stack([np.cos(measurements[:, 6]), np.sin(measurements[:, 6])], axis=1)
-                # cov_matrix = np.cov(directions.T)
-                # eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
-
-                # # Primary direction (largest eigenvalue)
-                # primary_direction = eigenvectors[:, np.argmax(eigenvalues)]
                 primary_direction = np.mean(directions, axis=0)
-
                 primary_yaw = np.arctan2(primary_direction[1], primary_direction[0])
-                median_yaw = np.median(measurements[:, 6])
-                mean_yaw = np.mean(measurements[:, 6])
-                print(f"{primary_yaw=:.3f} {median_yaw=:.3f} {mean_yaw=:.3f}")
+
                 yaws = primary_yaw.reshape(1).repeat(len(measurements))
 
             measurements[:, 6] = yaws[:len(measurements)]
@@ -988,12 +1087,15 @@ class ConvexHullTrack:
                 0.5 * time_offsets**2
             ])
             
+            # use the alst second
+            A = A[-10:]
+            positions = positions[-10:]
             pos_coeffs = np.linalg.lstsq(A, positions, rcond=None)[0]
             self.ellipse_pos_model = pos_coeffs  # [p0, v0, a] for each dimension
             
             # Similar for orientation (but be careful with wraparound)
             # unwrapped_theta = np.unwrap(orientations)
-            unwrapped_theta = orientations
+            unwrapped_theta = orientations[-10:]
             theta_coeffs = np.linalg.lstsq(A, unwrapped_theta, rcond=None)[0]
             self.ellipse_theta_model = theta_coeffs
 
@@ -1011,8 +1113,9 @@ class ConvexHullTrack:
         self.ellipse_size_splines = size_splines
         self.ellipse_time_ref = time_offsets[0]        
 
-        predictions = self.predict_ellipse_motion_model(self.timestamps)
-        
+        predictions = self.predict_ellipse_motion_model(self.timestamps[-10:])
+        measurements = measurements[-10:]
+
         r2 = r2_score(measurements, predictions, multioutput='uniform_average')
         rmse = mean_squared_error(measurements, predictions, multioutput='uniform_average')
 
@@ -1027,6 +1130,9 @@ class ConvexHullTrack:
         if self.ellipse_size_splines is None:
             measurements = np.array(self.ellipses, np.float32)
             design_matrix = np.column_stack([time_offsets, np.ones(len(time_offsets))])
+            # use the last second
+            design_matrix = design_matrix[-10:]
+            measurements = measurements[-10:]
             coefficients, residuals, *_ = np.linalg.lstsq(design_matrix, measurements, rcond=None)
             A, c = coefficients[0, :], coefficients[1, :]
 
@@ -1160,6 +1266,9 @@ class ConvexHullTrack:
         # Fit model
         design_matrix = np.column_stack([time_offsets, np.ones(len(time_offsets))])
         # coefficients, *_ = np.linalg.lstsq(design_matrix, measurements, rcond=None)
+        # design_matrix = design_matrix[-10:]
+        # measurements = measurements[-10:]
+
         coefficients, residuals, *_ = np.linalg.lstsq(design_matrix, measurements, rcond=None)
         self.A, self.c = coefficients[0, :], coefficients[1, :]
         
@@ -1214,11 +1323,14 @@ class ConvexHullTrack:
             measurements[:, 6] = yaws[:len(measurements)]
             
             # Fit
+            design_matrix = design_matrix[-10:]
+            measurements = measurements[-10:]
+
             coefficients, residuals, *_ = np.linalg.lstsq(design_matrix, measurements, rcond=None)
             A, c = coefficients[0, :], coefficients[1, :]
             
             # Quality metric
-            predictions = A * time_offsets[:, np.newaxis] + c
+            predictions = A * time_offsets[-10:, np.newaxis] + c
             r2 = r2_score(measurements, predictions, multioutput='uniform_average')
             
             return A, c, r2, measurements
@@ -1240,7 +1352,7 @@ class ConvexHullTrack:
         self.c = quality_weight_hist * c_hist + quality_weight_opt * c_opt
         
         # Evaluate combined model
-        predictions = self.A * time_offsets[:, np.newaxis] + self.c
+        predictions = self.A * time_offsets[-10:, np.newaxis] + self.c
         combined_measurements = quality_weight_hist * measurements_hist + quality_weight_opt * measurements_opt
         
         r2_combined = r2_score(combined_measurements, predictions, multioutput='uniform_average')
@@ -1333,30 +1445,26 @@ class ConvexHullTrack:
             dt = np.diff(time_offsets)
             velocities = np.diff(positions, axis=0) / dt[:, np.newaxis]
             speeds = np.linalg.norm(velocities[:, :2], axis=1)
-            
-            # Calculate yaws from velocity
-            velocity_yaws = np.arctan2(velocities[:, 1], velocities[:, 0])
-            
-            avg_speed = np.mean(speeds)
 
-            if avg_speed > self.heading_speed_thresh_ms:
-                yaws = velocity_yaws
-                yaws = np.concatenate([yaws, yaws[[-1]]], axis=0)
+            path_yaws = np.arctan2(velocities[:, 1], velocities[:, 0])
+
+            use_path_yaw = speeds > self.heading_speed_thresh_ms
+            n_fast_frames = np.sum(use_path_yaw)
+
+            if n_fast_frames > 0:
+                fast_indices = np.where(use_path_yaw)[0]
+
+                fps = path_yaws[fast_indices]
+                xps = time_offsets[fast_indices]
+                yaws = np.interp(time_offsets, xps, fps)
             else:
                 # yaws = np.median(measurements[:, 6]).reshape(1).repeat(len(measurements))
 
                 directions = np.stack([np.cos(measurements[:, 6]), np.sin(measurements[:, 6])], axis=1)
-                # cov_matrix = np.cov(directions.T)
-                # eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
 
-                # # Primary direction (largest eigenvalue)
-                # primary_direction = eigenvectors[:, np.argmax(eigenvalues)]
                 primary_direction = np.mean(directions, axis=0)
 
                 primary_yaw = np.arctan2(primary_direction[1], primary_direction[0])
-                median_yaw = np.median(measurements[:, 6])
-                mean_yaw = np.mean(measurements[:, 6])
-                print(f"{primary_yaw=:.3f} {median_yaw=:.3f} {mean_yaw=:.3f}")
                 yaws = primary_yaw.reshape(1).repeat(len(measurements))
 
 
@@ -1369,7 +1477,8 @@ class ConvexHullTrack:
         
         # Fit model
         design_matrix = np.column_stack([time_offsets, np.ones(len(time_offsets))])
-        # coefficients, *_ = np.linalg.lstsq(design_matrix, measurements, rcond=None)
+        # design_matrix = design_matrix[-10:]
+        # measurements = measurements[-10:]
         coefficients, residuals, *_ = np.linalg.lstsq(design_matrix, measurements, rcond=None)
         self.A, self.c = coefficients[0, :], coefficients[1, :]
         
@@ -1385,7 +1494,7 @@ class ConvexHullTrack:
         self.mean[:3] = box[:3]
         self.mean[3] = box[6]
 
-    def update_raw_lidar(self, kf: PoseKalmanFilter, points3d: np.array):
+    def update_raw_lidar(self, kf: PoseKalmanFilter, points3d: np.array, flow: np.array):
         """Perform Kalman filter measurement update step and update the feature
         cache.
 
@@ -1403,9 +1512,9 @@ class ConvexHullTrack:
         iou_2ds = np.array([x.iou_2d for x in self.history])
         objectness_scores = np.array([x.objectness_score for x in self.history])
 
-        mean_iou_2d = np.mean(iou_2ds)
-        mean_objectness = np.mean(objectness_scores)
-        confidence = np.mean(confidences)
+        mean_iou_2d: float = float(np.mean(iou_2ds))
+        mean_objectness: float = float(np.mean(objectness_scores))
+        confidence: float = float(np.mean(confidences))
 
         features = np.stack(self.features, axis=0)
         if confidence > 0.0:
@@ -1417,6 +1526,7 @@ class ConvexHullTrack:
 
         convex_hull = ConvexHullObject(
             original_points=points3d.copy(),
+            flow=flow.copy(),
             confidence=confidence,
             iou_2d=mean_iou_2d,
             objectness_score=mean_objectness,

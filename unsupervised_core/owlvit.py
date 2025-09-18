@@ -1,14 +1,19 @@
 import os
 import pickle as pkl
 
+import numpy as np
 from tqdm import trange
+
+from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
+    voxel_sampling_fast,
+)
+
 from .outline_utils import (
     OutlineFitter,
     TrackSmooth,
-    voxel_sampling,
     points_rigid_transform,
+    voxel_sampling,
 )
-import numpy as np
 
 
 class MFCF:
@@ -90,7 +95,7 @@ class MFCF:
             all_H = np.concatenate(all_H)
             all_points = all_points[all_H > thresh]
             new_box_points = np.concatenate([all_points, cur_points])
-            new_box_points = voxel_sampling(new_box_points)
+            new_box_points = voxel_sampling_fast(new_box_points)
 
             non_ground_points = self.outline_estimator.remove_ground(new_box_points)
             clusters, labels = self.outline_estimator.clustering(non_ground_points)

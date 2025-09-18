@@ -1,12 +1,35 @@
 from typing import Tuple
+
 import numpy as np
 import open3d as o3d
-
-from sklearn.neighbors import NearestNeighbors
+import torch
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import ConvexHull, cKDTree
 from sklearn.cluster import DBSCAN
+from sklearn.neighbors import NearestNeighbors
+
 from lion.unsupervised_core.outline_utils import points_rigid_transform
+
+
+def argo2_box_to_lidar(boxes):
+    if isinstance(boxes, np.ndarray):
+        boxes = torch.from_numpy(boxes)
+    elif not isinstance(boxes, torch.Tensor):
+        boxes = torch.tensor(boxes)
+
+    if boxes.dim() == 1:
+        boxes = boxes.unsqueeze(0)
+
+    cnt_xyz = boxes[:, :3]  # x, y, z centers
+    lwh = boxes[:, 3:6]  # length, width, height
+    quat = boxes[:, 6:]
+
+    # Convert yaw to quaternion
+    yaw = quat_to_yaw(quat[:, [0]], quat[:, [1]], quat[:, [2]], quat[:, [3]])
+
+    # Combine: [x, y, z, length, width, height, qw, qx, qy, qz]
+    lidar_boxes = torch.cat([cnt_xyz, lwh, yaw], dim=1)
+    return lidar_boxes
 
 def quat_to_yaw(qw, qx, qy, qz):
     """Convert quaternion to yaw angle.
@@ -209,10 +232,10 @@ def find_connected_components_lidar(points, threshold=0.5):
     
     return labels, n_components
 
-def fast_connected_components(points, eps=0.5):
+def fast_connected_components(points, eps=0.5, min_samples=1):
     """Faster connected components using DBSCAN or KDTree."""
     # Use DBSCAN for larger point clouds (optimized C implementation)
-    clustering = DBSCAN(eps=eps, min_samples=1, n_jobs=1, algorithm='kd_tree').fit(points)
+    clustering = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=1, algorithm='kd_tree').fit(points)
     labels = clustering.labels_
     # n_components = len(set(labels)) - (1 if -1 in labels else 0)
     n_components = labels.max() + 1
@@ -412,11 +435,11 @@ def icp(
     return R_final, t_final, A
 
 def icp_open3d_robust(source_points, target_points, 
-                     voxel_size=None,
+                     voxel_size=0.05,
                      max_correspondence_dist=None,
                      max_iterations=50,
                      use_point_to_plane=False,
-                     initial_alignment='none',  # 'none', 'ransac', or 4x4 matrix
+                     initial_alignment='ransac',  # 'none', 'ransac', or 4x4 matrix
                      return_full_result=False):
     """
     Robust ICP alignment using Open3D with optional initial alignment.

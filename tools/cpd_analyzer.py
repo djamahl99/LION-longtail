@@ -77,7 +77,11 @@ from sklearn.tree import (
 from tqdm import tqdm
 
 from lion.unsupervised_core.alpha_shape import AlphaShapeMFCF, OWLViTAlphaShapeMFCF
-from lion.unsupervised_core.box_utils import apply_pose_to_box, get_rotated_box
+from lion.unsupervised_core.box_utils import (
+    apply_pose_to_box,
+    argo2_box_to_lidar,
+    get_rotated_box,
+)
 from lion.unsupervised_core.c_proto_refine import C_PROTO, CSS
 from lion.unsupervised_core.mfcf import MFCF
 from lion.unsupervised_core.outline_utils import (
@@ -1902,27 +1906,6 @@ def lidar_box_to_argo2(boxes):
     # Combine: [x, y, z, length, width, height, qw, qx, qy, qz]
     argo_cuboid = torch.cat([cnt_xyz, lwh, quat], dim=1)
     return argo_cuboid
-
-
-def argo2_box_to_lidar(boxes):
-    if isinstance(boxes, np.ndarray):
-        boxes = torch.from_numpy(boxes)
-    elif not isinstance(boxes, torch.Tensor):
-        boxes = torch.tensor(boxes)
-
-    if boxes.dim() == 1:
-        boxes = boxes.unsqueeze(0)
-
-    cnt_xyz = boxes[:, :3]  # x, y, z centers
-    lwh = boxes[:, 3:6]  # length, width, height
-    quat = boxes[:, 6:]
-
-    # Convert yaw to quaternion
-    yaw = quat_to_yaw(quat[:, [0]], quat[:, [1]], quat[:, [2]], quat[:, [3]])
-
-    # Combine: [x, y, z, length, width, height, qw, qx, qy, qz]
-    lidar_boxes = torch.cat([cnt_xyz, lwh, yaw], dim=1)
-    return lidar_boxes
 
 
 def convert_to_argoverse2(
@@ -3812,7 +3795,7 @@ def extract_all_features_accurate(
     category_mapping: Optional[Dict[str, str]] = None,
     gts_dataframe: pd.DataFrame = None,
     use_first_frame=False,
-    do_single_frame=True,
+    do_single_frame=False,
     score_thresh: float = 0,
 ) -> pd.DataFrame:
     """
@@ -3959,10 +3942,11 @@ def extract_all_features_accurate(
             "timestamp", frame_info.get("timestamp_ns", frame_idx * 100000000)
         )
 
-        gt_frame = gts_dataframe[
-            (gts_dataframe["timestamp_ns"] == int(timestamp_ns))
-            & (gts_dataframe["log_id"] == log_id)
-        ]
+        # gt_frame = gts_dataframe[
+        #     (gts_dataframe["timestamp_ns"] == int(timestamp_ns))
+        #     & (gts_dataframe["log_id"] == log_id)
+        # ]
+        gt_frame = gts_dataframe.loc[[(log_id, int(timestamp_ns))]]
 
         gt_lidar_boxes = argo2_box_to_lidar(
             gt_frame[
@@ -4157,10 +4141,10 @@ def extract_all_features_accurate(
                 prev_boxes = None
                 prev_timestamps = None
 
-            advanced_features = extractor.extract_advanced_objectness_features(
-                lidar_points, H, box, prev_boxes, prev_timestamps
-            )
-            detection.update(advanced_features)
+            # advanced_features = extractor.extract_advanced_objectness_features(
+            #     lidar_points, H, box, prev_boxes, prev_timestamps
+            # )
+            # detection.update(advanced_features)
 
             # Additional heuristics from config
             detection["max_distance_threshold"] = extractor.css.max_dis
@@ -4921,6 +4905,7 @@ def analyze_mfcf(args, cfg, dataset_dir: Path, output_dir: Path):
                     ) as f:
                         f.write(s.getvalue())
             else:
+                print(f"read from {cur_features_output_path}")
                 df_features = pd.read_feather(cur_features_output_path)
 
             serialized_dts_list.append(df_features)
@@ -5455,15 +5440,20 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     print(f"{len(owlvit_log_ids)=}")
     # exit()
 
-    vis_log_id = '42f92807-0c5e-3397-bd45-9d5303b4db2a'
-    # vis_log_id = 'c2d44a70-9fd4-3298-ad0a-c4c9712e6f1e'
 
     not_done_log_ids = list(set(owlvit_log_ids).difference(owlvit_alpha_shape_log_ids))
+    not_done_log_ids = sorted(not_done_log_ids)
     print(f"not_done_log_ids {len(not_done_log_ids)}")
 
+    vis_log_id = '42f92807-0c5e-3397-bd45-9d5303b4db2a'
+    # vis_log_id = 'c2d44a70-9fd4-3298-ad0a-c4c9712e6f1e'
+    vis_log_id = '27c03d98-6ac3-38a3-ba5e-102b184d01ef'
+    vis_log_id = 'e72ef05c-8b94-3885-a34f-fff3b2b954b4'
+    vis_log_id = np.random.choice(not_done_log_ids)
+
     if len(owlvit_alpha_shape_log_ids) == 0 or True:
-        for log_id in [np.random.choice(not_done_log_ids)]:  # TODO: do all
-        # for log_id in [vis_log_id]:
+        # for log_id in [np.random.choice(not_done_log_ids)]:  # TODO: do all
+        for log_id in [vis_log_id]:
             # pr = cProfile.Profile()
             # pr.enable()
             print(f"running on {log_id=}")
@@ -5574,8 +5564,8 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
             )
 
             # TODO: COMMENT OUT LATER
-            # if cur_features_output_path.exists():
-            #     os.remove(cur_features_output_path)
+            if cur_features_output_path.exists():
+                os.remove(cur_features_output_path)
 
             if not cur_features_output_path.exists():
                 df_features = extract_all_features_accurate(
@@ -5609,11 +5599,11 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
         # print(f"{non_string_cols=}")
 
         # Save if path provided
-        if features_output_path is not None:
-            if not features_output_path.suffix == ".feather":
-                features_output_path = features_output_path.with_suffix(".feather")
-            df_features.to_feather(features_output_path)
-            print(f"\nSaved to {features_output_path}")
+        # if features_output_path is not None:
+        #     if not features_output_path.suffix == ".feather":
+        #         features_output_path = features_output_path.with_suffix(".feather")
+        #     df_features.to_feather(features_output_path)
+        #     print(f"\nSaved to {features_output_path}")
     else:
         df_features = pd.read_feather(features_output_path)
 

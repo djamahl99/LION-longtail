@@ -446,6 +446,13 @@ def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.nda
 
     A_translated = A + t
 
+    new_distances = np.linalg.norm(B-A_translated, axis=1)
+
+    # inliers = new_distances <= min(0.5, np.quantile(new_distances, 0.75))
+    inliers = new_distances <= np.quantile(new_distances, 0.75)
+    A_translated = A_translated[inliers]
+    B = B[inliers]
+
     # Extract x and y coordinates for z-axis rotation
     Ax, Ay = A_translated[:, 0], A_translated[:, 1]  # X,Y → Z-axis rotation (yaw)
     # Ax, Ay = A[:, 0], A[:, 1]  # X,Y → Z-axis rotation (yaw)
@@ -456,25 +463,50 @@ def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.nda
     denominator = np.sum(Bx * Ax + By * Ay)
     theta = np.arctan2(numerator, denominator)
 
+    if np.abs(theta) < 0.1:
+        theta = 0.0
+
     # Z-axis rotation matrix
     cos_theta, sin_theta = np.cos(theta), np.sin(theta)
     R = np.array([[cos_theta, -sin_theta, 0], 
                   [sin_theta,  cos_theta, 0], 
                   [0,          0,         1]])
 
-    # Translation after rotation
-    # A_rotated = (R @ A.T).T
-    # t = np.mean(B - A_rotated, axis=0)
-
-    # dists_before = np.linalg.norm(B-A, axis=1)
-    # A_rotated = (R @ A_translated.T).T
-    # dists_post_rotate = np.linalg.norm(B-A_rotated, axis=1)
-
-    # print("dists_before", dists_before.min(), dists_before.mean(), dists_before.max())
-    # print("dists_post_rotate", dists_post_rotate.min(), dists_post_rotate.mean(), dists_post_rotate.max())
 
     return R, t
 
+def estimate_2d_rigid_transform_from_flow(points, flow):
+    """Estimate 2D rigid transform (rotation + translation) in XY plane"""
+    A = points
+    B = A + flow
+    # Center points
+    # centroid_A = np.mean(A[:, :2], axis=0)
+    # centroid_B = np.mean(B[:, :2], axis=0)
+    
+    # A_centered = A[:, :2] - centroid_A
+    # B_centered = B[:, :2] - centroid_B
+    
+    # Cross-covariance matrix for 2D
+    H = A.T @ B
+    
+    # SVD for 2D rotation
+    U, S, Vt = np.linalg.svd(H)
+    R_2d = Vt.T @ U.T
+    
+    # Ensure proper rotation
+    if np.linalg.det(R_2d) < 0:
+        Vt[-1, :] *= -1
+        R_2d = Vt.T @ U.T
+    
+    # Extend to 3D
+    R = np.eye(3)
+    R[:2, :2] = R_2d
+    
+    # Translation
+    t = np.zeros(3)
+    t[:3] = np.mean(flow, axis=0)  # Z translation from flow
+    
+    return R, t
 
 def relative_object_rotation(
     points1: np.ndarray,

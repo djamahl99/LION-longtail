@@ -19,6 +19,7 @@ MAX_POINTS = 1024
 
 class ConvexHullObject(object):
     original_points: np.ndarray = None
+    flow: np.ndarray = None
     confidence: float
     objectness_score: float
     iou_2d: float
@@ -29,6 +30,7 @@ class ConvexHullObject(object):
     def __init__(
         self,
         original_points: np.ndarray,
+        flow: np.ndarray,
         confidence: float,
         iou_2d: float,
         objectness_score: float,
@@ -64,20 +66,29 @@ class ConvexHullObject(object):
             print(f"ConvexHullObject: Last dimension must be less than 20 metres {lwh=}")
             return None
 
-        if len(original_points) > MAX_POINTS:
-            orig_len = len(original_points)
+        # if len(original_points) > MAX_POINTS:
+        #     orig_len = len(original_points)
 
-            sampled_points = voxel_sampling_fast(original_points)
-            cur_len = len(sampled_points)
 
-            indices = np.random.randint(0, cur_len, size=MAX_POINTS)
-            original_points = sampled_points[indices]
-            # print(f"Resampled original_points {orig_len} -> {len(original_points)}")
+        #     indices = np.random.randint(0, orig_len, size=MAX_POINTS)
+        #     original_points = original_points[indices]
+        #     flow = flow[indices]
+
+        #     # can't do as won't align with flow
+        #     # sampled_points = voxel_sampling_fast(original_points)
+        #     # cur_len = len(sampled_points)
+
+        #     # indices = np.random.randint(0, cur_len, size=MAX_POINTS)
+        #     # original_points = sampled_points[indices]
+        #     # print(f"Resampled original_points {orig_len} -> {len(original_points)}")
 
         if len(original_points) < 10:
             return None
 
+        assert len(flow) == len(original_points), f"{original_points.shape=} {flow.shape=}"
+
         self.original_points = original_points.copy()
+        self.flow = flow.copy()
         self.confidence = confidence
         self.iou_2d = iou_2d
         self.objectness_score = objectness_score
@@ -85,8 +96,14 @@ class ConvexHullObject(object):
         self.timestamp = timestamp
         self.source = source
 
+        flow_mean = np.mean(flow, axis=0)
+        flow_yaw = None
+        if np.linalg.norm(flow_mean) > 0.36: # FIXME: heading_speed_thresh * 0.1
+            flow_yaw = np.arctan2(flow_mean[1], flow_mean[0])
+            print("flow_yaw", flow_yaw)
+
         self.mesh = trimesh.convex.convex_hull(self.original_points)
-        self.box = ConvexHullObject.points_to_bounding_box(self.mesh.vertices, centre=self.mesh.centroid)
+        self.box = ConvexHullObject.points_to_bounding_box(self.mesh.vertices, centre=self.mesh.centroid, yaw=flow_yaw)
         self.centroid_3d = self.box[:3]
         self.pose_vector = PoseKalmanFilter.box_to_pose_vector(self.box)
 
@@ -97,20 +114,50 @@ class ConvexHullObject(object):
         world_to_object = np.linalg.inv(obj_pose)
         self.object_points = points_rigid_transform(original_points, world_to_object)
 
+
     @staticmethod
-    def points_to_bounding_box(points3d: np.ndarray, centre: np.ndarray) -> np.ndarray:
+    def points_to_bounding_box(points3d: np.ndarray, centre: np.ndarray, yaw = None) -> np.ndarray:
         """Convert points to bounding box [x, y, z, length, width, height, yaw]."""
 
+        if yaw is not None:
+            centred_points3d = points3d - centre
+            centre_x, centre_y, centre_z = centre
+
+            # Rotate vertices to align with yaw=0
+            cos_yaw = np.cos(-yaw)
+            sin_yaw = np.sin(-yaw)
+            rotation_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+
+            rotated_xy = centred_points3d[:, :2] @ rotation_matrix.T
+
+            length = rotated_xy[:, 0].max() - rotated_xy[:, 0].min()
+            width = rotated_xy[:, 1].max() - rotated_xy[:, 1].min()
+            height = centred_points3d[:, 2].max() - centred_points3d[:, 2].min()
+
+            box =  np.array([centre_x, centre_y, centre_z, length, width, height, yaw])
+
+            # print("box with yaw", box)
+
+            # box_pca = ConvexHullObject.pca_points_to_bounding_box(points3d, centre)
+
+            # print("box with pca", box_pca)
+
+
+            return box
+
+
         box_pca = ConvexHullObject.pca_points_to_bounding_box(points3d, centre)
-        box_lshape = ConvexHullObject.lshape_points_to_bounding_box(points3d, centre)
+        return box_pca
+        # box_lshape = ConvexHullObject.lshape_points_to_bounding_box(points3d, centre)
 
-        lwh_pca = box_pca[3:6]
-        lwh_lshape = box_lshape[3:6]
+        # lwh_pca = box_pca[3:6]
+        # lwh_lshape = box_lshape[3:6]
 
-        if np.prod(lwh_pca) < np.prod(lwh_lshape):
-            return box_pca
+        # if np.prod(lwh_pca) < np.prod(lwh_lshape):
+        #     return box_pca
         
-        return box_lshape
+        # return box_lshape
+
 
     def lshape_points_to_bounding_box(points3d: np.ndarray, centre: np.ndarray, 
                                 angle_resolution: float = 1.0,
