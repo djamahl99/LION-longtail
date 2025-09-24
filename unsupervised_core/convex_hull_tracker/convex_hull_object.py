@@ -1,9 +1,11 @@
 import numpy as np
 import trimesh
+from scipy.spatial.transform import Rotation
 from shapely.geometry import MultiPoint
 
 from lion.unsupervised_core.box_utils import get_rotated_3d_box_corners
 from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
+    analytical_z_rotation_centered,
     voxel_sampling_fast,
 )
 from lion.unsupervised_core.convex_hull_tracker.l_shaped_fit import (
@@ -12,10 +14,12 @@ from lion.unsupervised_core.convex_hull_tracker.l_shaped_fit import (
 )
 from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import (
     PoseKalmanFilter,
+    wrap_angle,
 )
 from lion.unsupervised_core.outline_utils import points_rigid_transform
 
 MAX_POINTS = 1024
+NANOSEC_TO_SEC = 1e-9
 
 class ConvexHullObject(object):
     original_points: np.ndarray = None
@@ -27,6 +31,7 @@ class ConvexHullObject(object):
     timestamp: int
     source: str
     box: np.ndarray
+    is_moving: bool = False
     def __init__(
         self,
         original_points: np.ndarray,
@@ -66,21 +71,21 @@ class ConvexHullObject(object):
             print(f"ConvexHullObject: Last dimension must be less than 20 metres {lwh=}")
             return None
 
-        # if len(original_points) > MAX_POINTS:
-        #     orig_len = len(original_points)
+        if len(original_points) > MAX_POINTS:
+            orig_len = len(original_points)
 
 
-        #     indices = np.random.randint(0, orig_len, size=MAX_POINTS)
-        #     original_points = original_points[indices]
-        #     flow = flow[indices]
+            indices = np.random.randint(0, orig_len, size=MAX_POINTS)
+            original_points = original_points[indices]
+            flow = flow[indices]
 
-        #     # can't do as won't align with flow
-        #     # sampled_points = voxel_sampling_fast(original_points)
-        #     # cur_len = len(sampled_points)
+            # can't do as won't align with flow
+            # sampled_points = voxel_sampling_fast(original_points)
+            # cur_len = len(sampled_points)
 
-        #     # indices = np.random.randint(0, cur_len, size=MAX_POINTS)
-        #     # original_points = sampled_points[indices]
-        #     # print(f"Resampled original_points {orig_len} -> {len(original_points)}")
+            # indices = np.random.randint(0, cur_len, size=MAX_POINTS)
+            # original_points = sampled_points[indices]
+            # print(f"Resampled original_points {orig_len} -> {len(original_points)}")
 
         if len(original_points) < 10:
             return None
@@ -97,15 +102,32 @@ class ConvexHullObject(object):
         self.source = source
 
         flow_mean = np.mean(flow, axis=0)
-        flow_yaw = None
+        flow_yaw1 = None
+        self.is_moving = False
         if np.linalg.norm(flow_mean) > 0.36: # FIXME: heading_speed_thresh * 0.1
-            flow_yaw = np.arctan2(flow_mean[1], flow_mean[0])
-            print("flow_yaw", flow_yaw)
+            flow_yaw1 = float(np.arctan2(flow_mean[1], flow_mean[0]))
+            self.is_moving = True
+            # print("flow_yaw", flow_yaw)
 
         self.mesh = trimesh.convex.convex_hull(self.original_points)
-        self.box = ConvexHullObject.points_to_bounding_box(self.mesh.vertices, centre=self.mesh.centroid, yaw=flow_yaw)
+
+        centered_i = self.original_points.copy() - self.mesh.centroid
+        centered_j = centered_i + flow
+        R_flow, t_flow = analytical_z_rotation_centered(centered_i, centered_j)
+
+        flow_yaw2 = float(Rotation.from_matrix(R_flow).as_rotvec()[2])
+
+        self.flow_yaw1 = flow_yaw1
+        self.flow_yaw2 = flow_yaw2
+        self.t_flow = t_flow
+        # if flow_yaw1 is not None:
+        #     print(f"{flow_yaw1=:.2f} {flow_yaw2=:.2f}")
+
+        self.box = ConvexHullObject.points_to_bounding_box(self.mesh.vertices, centre=self.mesh.centroid, yaw=self.flow_yaw1)
         self.centroid_3d = self.box[:3]
         self.pose_vector = PoseKalmanFilter.box_to_pose_vector(self.box)
+
+
 
         self.hull = MultiPoint(self.original_points).convex_hull
         self.z_min, self.z_max = self.original_points[:, 2].min(), self.original_points[:, 2].max()
@@ -114,6 +136,52 @@ class ConvexHullObject(object):
         world_to_object = np.linalg.inv(obj_pose)
         self.object_points = points_rigid_transform(original_points, world_to_object)
 
+    # def to_timestamped_box(self, timestamp: int):
+    #     # extrapolate to some new timestamp
+    #     dt = (timestamp - self.timestamp) * NANOSEC_TO_SEC
+    #     dlt_dt = 0.1
+
+    #     dt_delta = dt / dlt_dt
+
+
+    #     # assert dt_delta >= 1 # should be true...
+
+    #     flow = self.flow.copy() * dt_delta
+
+    #     t = flow.mean(axis=0)
+    #     box = self.box.copy()
+    #     box[:3] += t
+
+    #     box2 = self.box.copy()
+
+    #     box2[:3] += self.t_flow * dt_delta
+    #     box2[6] += wrap_angle(self.flow_yaw2 * dt_delta)
+
+    #     # if np.linalg.norm(box2 - box) > 0.5:
+    #     #     print("box2 != box")
+    #     #     print("box", box)
+    #     #     print("box2", box2)
+
+    #     # if np.linalg.norm(self.box[:3] - box[:3]) > 0.5 or self.is_moving:
+    #     #     print(f"{dt_delta=:.2f} {dt=:.2f} {dlt_dt=:.2f}")
+    #     #     print('orig box', self.box)
+    #     #     print('to_timestamped_box', box)
+
+    #     return 
+        
+    def to_timestamped_box(self, timestamp: int):
+        dt = (timestamp - self.timestamp) * NANOSEC_TO_SEC
+        dt_delta = dt / 0.1
+        
+        box = self.box.copy()
+        
+        if self.is_moving:
+            # Use the analytical motion model
+            box[:3] += self.t_flow * dt_delta
+            box[6] = wrap_angle(box[6] + self.flow_yaw2 * dt_delta)
+        # else: stationary object, no motion update needed
+        
+        return box
 
     @staticmethod
     def points_to_bounding_box(points3d: np.ndarray, centre: np.ndarray, yaw = None) -> np.ndarray:

@@ -43,6 +43,15 @@ def quat_to_yaw(qw, qx, qy, qz):
     # For rotation around Z-axis: yaw = 2 * atan2(qz, qw)
     return 2 * np.arctan2(qz, qw)
 
+def get_box_bev_corners(box):
+    assert len(box) == 7
+
+    center_xy = box[:2]
+    length = box[3]
+    width = box[4]
+    yaw = box[6]
+
+    return get_rotated_box(center_xy, length, width, yaw)
 
 def get_rotated_box(center_xy, length, width, yaw):
     """Return 4 corners of rotated rectangle (BEV)"""

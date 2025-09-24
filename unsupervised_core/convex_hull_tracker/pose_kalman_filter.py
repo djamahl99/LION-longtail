@@ -173,6 +173,10 @@ class PoseKalmanFilter(object):
         
         return new_mean, new_covariance
 
+    @staticmethod
+    def box_to_transform(box):
+        return PoseKalmanFilter.pose_vector_to_transform(PoseKalmanFilter.box_to_pose_vector(box))
+
     @staticmethod  
     def box_to_pose_vector(box):
         return np.array([box[0], box[1], box[2], box[6]])  # [x, y, z, yaw]

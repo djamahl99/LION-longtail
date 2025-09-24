@@ -173,63 +173,63 @@ class ConvexHullKalmanTracker:
         unmatched_and_missed = set()
         unmatched_and_found = set()
 
-        unmatched_ious = []
-        for track_idx in unmatched_tracks:
-            track = self.tracks[track_idx]
-
-            if track.is_deleted():
-                continue
-
-            pos = track.mean[:3] # change to box[:3]
-            radius = np.linalg.norm(track.lwh * 0.5)
-
-            lidar_indices = lidar_tree.query_ball_point(pos, radius)
-            lidar_indices = np.array(lidar_indices, int)
-
-            iou = 0.0
-            if len(lidar_indices) > self.min_component_points:
-                track_box = track.to_box()
-                cmp_points = lidar_tree.data[lidar_indices]
-
-                # get points in the bbox
-                n_orig_points = len(cmp_points)
-                points_mask = ConvexHullObject.points_in_box(track_box, cmp_points.copy(), ret_mask=True)
-                lidar_indices = lidar_indices[points_mask]
-                cmp_points = cmp_points[points_mask]
-                cmp_flow = flow[lidar_indices]
-
-                n_in_box = len(cmp_points)
-
-                flow_mean = np.mean(cmp_flow, axis=0)
-                flow_yaw = None
-                if np.linalg.norm(flow_mean) > 0.36: # FIXME: heading_speed_thresh * 0.1
-                    flow_yaw = np.arctan2(flow_mean[1], flow_mean[0])
-
-                if n_in_box < self.min_component_points:
-                    continue
-
-                cur_box = ConvexHullObject.points_to_bounding_box(
-                    cmp_points, track_box[:3], flow_yaw
-                )
-
-                iou = box_iou_3d(cur_box, track_box)
-
-            unmatched_ious.append(iou)
-
-            # if err > self.n_points_err_thresh:
-            if iou < self.nms_stg2_iou_threshold:
-                self.tracks[track_idx].mark_missed()
-                unmatched_and_missed.add(track_idx)
-            else:
-                self.tracks[track_idx].update_raw_lidar(self.kf, cmp_points, cmp_flow)
-                unmatched_and_found.add(track_idx)
-
-        if len(unmatched_ious) > 0:
-            print("unmatched_ious", np.min(unmatched_ious), np.mean(unmatched_ious), np.max(unmatched_ious))
-
+        # unmatched_ious = []
         # for track_idx in unmatched_tracks:
-        #     self.tracks[track_idx].mark_missed()
-        #     unmatched_and_missed.add(track_idx)
+        #     track = self.tracks[track_idx]
+
+        #     if track.is_deleted():
+        #         continue
+
+        #     pos = track.mean[:3] # change to box[:3]
+        #     radius = np.linalg.norm(track.lwh * 0.5)
+
+        #     lidar_indices = lidar_tree.query_ball_point(pos, radius)
+        #     lidar_indices = np.array(lidar_indices, int)
+
+        #     iou = 0.0
+        #     if len(lidar_indices) > self.min_component_points:
+        #         track_box = track.to_box()
+        #         cmp_points = lidar_tree.data[lidar_indices]
+
+        #         # get points in the bbox
+        #         n_orig_points = len(cmp_points)
+        #         points_mask = ConvexHullObject.points_in_box(track_box, cmp_points.copy(), ret_mask=True)
+        #         lidar_indices = lidar_indices[points_mask]
+        #         cmp_points = cmp_points[points_mask]
+        #         cmp_flow = flow[lidar_indices]
+
+        #         n_in_box = len(cmp_points)
+
+        #         flow_mean = np.mean(cmp_flow, axis=0)
+        #         flow_yaw = None
+        #         if np.linalg.norm(flow_mean) > 0.36: # FIXME: heading_speed_thresh * 0.1
+        #             flow_yaw = np.arctan2(flow_mean[1], flow_mean[0])
+
+        #         if n_in_box < self.min_component_points:
+        #             continue
+
+        #         cur_box = ConvexHullObject.points_to_bounding_box(
+        #             cmp_points, track_box[:3], flow_yaw
+        #         )
+
+        #         iou = box_iou_3d(cur_box, track_box)
+
+        #     unmatched_ious.append(iou)
+
+        #     # if err > self.n_points_err_thresh:
+        #     if iou < self.nms_stg2_iou_threshold:
+        #         self.tracks[track_idx].mark_missed()
+        #         unmatched_and_missed.add(track_idx)
+        #     else:
+        #         self.tracks[track_idx].update_raw_lidar(self.kf, cmp_points, cmp_flow)
+        #         unmatched_and_found.add(track_idx)
+
+        # if len(unmatched_ious) > 0:
+        #     print("unmatched_ious", np.min(unmatched_ious), np.mean(unmatched_ious), np.max(unmatched_ious))
+
+        for track_idx in unmatched_tracks:
+            self.tracks[track_idx].mark_missed()
+            unmatched_and_missed.add(track_idx)
 
         # tracks_tree = cKDTree([x.to_box()[:3] for x in self.tracks if not x.is_deleted()])
         for detection_idx in unmatched_detections:

@@ -287,6 +287,7 @@ class ConvexHullTrack:
         self._last_processed_frame = 0
 
         self.icp_cache = {}
+        self.flow_cache = {}
 
     def extrapolate_box(self, timestamps):
         new_prediction = self.history_box_predictor.predict_boxes(timestamps)
@@ -458,39 +459,43 @@ class ConvexHullTrack:
 
 
     def get_or_compute_relative_pose_flow(self, points_i, flow_i, center, cache_key):
-        if cache_key in self.icp_cache:
-            R_cached, t_cached, center_old = self.icp_cache[cache_key]
+        if cache_key in self.flow_cache:
+            R_cached, t_cached, center_old = self.flow_cache[cache_key]
             # Transform translation for new center
             delta = center_old - center
             t_new = t_cached + (np.eye(3) - R_cached) @ delta
             return R_cached, t_new
         
-        # Compute and cache
-        mean_flow = np.mean(flow_i, axis=0)
-        A = points_i - center
-        B = A + flow_i - mean_flow
+        # # Compute and cache
+        # mean_flow = np.mean(flow_i, axis=0)
+        # A = points_i - center
+        # B = A + flow_i - mean_flow
 
-        # Cross-covariance matrix for 2D
-        H = A[:, :2].T @ B[:, :2]
+        # # Cross-covariance matrix for 2D
+        # H = A[:, :2].T @ B[:, :2]
         
-        # SVD for 2D rotation
-        U, S, Vt = np.linalg.svd(H)
-        R_2d = Vt.T @ U.T
+        # # SVD for 2D rotation
+        # U, S, Vt = np.linalg.svd(H)
+        # R_2d = Vt.T @ U.T
         
-        # Ensure proper rotation
-        if np.linalg.det(R_2d) < 0:
-            Vt[-1, :] *= -1
-            R_2d = Vt.T @ U.T
+        # # Ensure proper rotation
+        # if np.linalg.det(R_2d) < 0:
+        #     Vt[-1, :] *= -1
+        #     R_2d = Vt.T @ U.T
         
-        # Extend to 3D
-        R_flow = np.eye(3)
-        R_flow[:2, :2] = R_2d
+        # # Extend to 3D
+        # R_flow = np.eye(3)
+        # R_flow[:2, :2] = R_2d
         
-        # Translation
-        t_flow = np.zeros(3)
-        t_flow[:3] = mean_flow
+        # # Translation
+        # t_flow = np.zeros(3)
+        # t_flow[:3] = mean_flow
 
-        self.icp_cache[cache_key] = (R_flow, t_flow, center.copy())
+        centered_i = points_i.copy() - center
+        centered_j = centered_i + flow_i
+        R_flow, t_flow = analytical_z_rotation_centered(centered_i, centered_j)
+
+        self.flow_cache[cache_key] = (R_flow, t_flow, center.copy())
         return R_flow, t_flow
 
     def compute_poses(self):
@@ -507,8 +512,11 @@ class ConvexHullTrack:
 
         # use initial pose as reference
         ref_pose_vector = PoseKalmanFilter.box_to_pose_vector(boxes[0])
-        ref_pose_matrix = PoseKalmanFilter.pose_vector_to_transform(ref_pose_vector)
+        ref_pose_matrix = PoseKalmanFilter.box_to_transform(boxes[0])
         world_to_object = np.linalg.inv(ref_pose_matrix)
+
+        boxes_poses = [PoseKalmanFilter.box_to_transform(box) for box in boxes]
+
 
         last_position = ref_pose_vector[:3].copy()
         initial_position = ref_pose_vector[:3].copy()
@@ -531,153 +539,180 @@ class ConvexHullTrack:
 
         flow_positions = [last_optimized_position]
 
-        for i in range(n_frames):
-            R_flow, t_flow = self.get_or_compute_relative_pose_flow(points_list[i], flow_list[i], last_optimized_position, (i, i+1))
-
-            flow_yaw = Rotation.from_matrix(R_flow).as_rotvec()[2]
-            flow_positions.append(last_optimized_position + t_flow)
-
-            optimized_position = last_optimized_position + t_flow
-            optimized_yaw = wrap_angle(last_optimized_yaw + flow_yaw)
-
-            pose = np.eye(4)
-            pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, optimized_yaw], float)).as_matrix()
-            pose[:3, 3] = optimized_position
-            optimized_poses.append(pose)
-
-            last_optimized_position = np.copy(optimized_position)
-            last_optimized_yaw = np.copy(optimized_yaw)
-
-        # spline_poses = compute_spline_poses(self.timestamps, optimized_poses)
-        # spline_vecs = np.stack([PoseKalmanFilter.transform_to_pose_vector(x) for x in spline_poses], axis=0)
-        # orig = np.stack([PoseKalmanFilter.transform_to_pose_vector(x) for x in optimized_poses], axis=0)
-
-        # for i in range(1, n_frames):
-        #     R_rel, t_rel, icp_cost_rel, iou_rel, _, _ = self.get_or_compute_relative_pose(
-        #         points_list[i-1], points_list[i], 
-        #         last_optimized_position,
-        #         (i-1, i)
-        #     )
-    
-        #     rel_yaw = Rotation.from_matrix(R_rel).as_rotvec()[2]
-        #     rel_yaw_guess = wrap_angle(last_optimized_yaw + rel_yaw)
-
-        #     if i == 1:
-        #         R_init, t_init, icp_cost_initial, iou_initial = R_rel, t_rel, icp_cost_rel, iou_rel
-        #     else:
-        #         R_init, t_init, icp_cost_initial, iou_initial, _, _ = self.get_or_compute_relative_pose(
-        #             points_list[0], points_list[i], 
-        #             initial_position,
-        #             (0, i)
-        #         )
-
-        #     mean_flow = np.mean(flow_list[i], axis=0)
-        #     A = points_list[i] - last_optimized_position
-        #     B = A + flow_list[i] - mean_flow
-
-        #     # Cross-covariance matrix for 2D
-        #     H = A[:, :2].T @ B[:, :2]
-            
-        #     # SVD for 2D rotation
-        #     U, S, Vt = np.linalg.svd(H)
-        #     R_2d = Vt.T @ U.T
-            
-        #     # Ensure proper rotation
-        #     if np.linalg.det(R_2d) < 0:
-        #         Vt[-1, :] *= -1
-        #         R_2d = Vt.T @ U.T
-            
-        #     # Extend to 3D
-        #     R_flow = np.eye(3)
-        #     R_flow[:2, :2] = R_2d
-            
-        #     # Translation
-        #     t_flow = np.zeros(3)
-        #     t_flow[:3] = mean_flow
+        # for i in range(n_frames):
+        #     R_flow, t_flow = self.get_or_compute_relative_pose_flow(points_list[i], flow_list[i], last_optimized_position, (i, i+1))
 
         #     flow_yaw = Rotation.from_matrix(R_flow).as_rotvec()[2]
-
-        #     print("flow_yaw", flow_yaw, "t_flow", t_flow)
-        #     print("rel_yaw_guess", rel_yaw_guess, "t_rel", t_rel)
-
         #     flow_positions.append(last_optimized_position + t_flow)
 
-        #     initial_yaw_guess = wrap_angle(initial_yaw + Rotation.from_matrix(R_init).as_rotvec()[2])
-
-        #     # pose guesses
-        #     rel_pos_guess = last_optimized_position + t_rel
-        #     initial_pos_guess = initial_position + t_init
-
-        #     # compute boxes for each
-        #     box_rel = np.concatenate([rel_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), rel_yaw_guess.reshape(1)], axis=0)
-        #     box_init = np.concatenate([initial_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), initial_yaw_guess.reshape(1)], axis=0)
-        #     orig_box = boxes[i]
-
-        #     box_mask_rel = ConvexHullObject.points_in_box(box_rel, points_list[i], ret_mask=True)
-        #     box_mask_init = ConvexHullObject.points_in_box(box_init, points_list[i], ret_mask=True)
-        #     box_mask_orig = ConvexHullObject.points_in_box(orig_box, points_list[i], ret_mask=True)
-
-        #     box_iou_rel = box_mask_rel.sum() / box_mask_rel.size
-        #     box_iou_init = box_mask_init.sum() / box_mask_rel.size
-        #     box_iou_orig = box_mask_orig.sum() / box_mask_rel.size
-
-        #     # Compute current velocities
-        #     dt = (timestamps[i] - timestamps[i-1]) * 1e-9
-        #     velocity_rel = (rel_pos_guess - last_optimized_position) / dt
-        #     velocity_init = (initial_pos_guess - last_optimized_position) / dt
-        #     velocity_box = (orig_box[:3] - last_optimized_position) / dt
-
-        #     # Smoothness penalties
-        #     lambda_smooth = 0.1  # Tunable parameter
-        #     smooth_cost_rel = lambda_smooth * np.linalg.norm(velocity_rel - last_velocity)**2 
-        #     smooth_cost_init = lambda_smooth * np.linalg.norm(velocity_init - last_velocity)**2
-        #     smooth_cost_orig = lambda_smooth * np.linalg.norm(velocity_box - last_velocity)**2
-
-        #     # iou_cost_rel = (1.0 - iou_rel)
-        #     # iou_cost_initial = (1.0 - iou_initial)
-
-
-        #     # weight between the two
-        #     # total_cost_rel = icp_cost_rel + smooth_cost_rel + iou_cost_rel
-        #     # total_cost_init = icp_cost_initial + smooth_cost_init + iou_cost_initial
-        #     total_cost_rel = (1.0 - box_iou_rel) + smooth_cost_rel
-        #     total_cost_init = (1.0 - box_iou_init) + smooth_cost_init
-        #     total_cost_orig = (1.0 - box_iou_orig) + smooth_cost_orig
-
-        #     weight_rel = 1.0 / (total_cost_rel + 1e-6)
-        #     weight_initial = 1.0 / (total_cost_init + 1e-6)
-        #     weight_orig = 1.0 / (total_cost_orig + 1e-6)
-
-        #     total_weight = weight_rel + weight_initial + weight_orig
-        #     weight_rel /= total_weight
-        #     weight_initial /= total_weight
-        #     weight_orig /= total_weight
-
-        #     print(f"{float(weight_rel)=} {float(weight_initial)=} {float(weight_orig)=}")
-
-        #     optimized_position = rel_pos_guess * weight_rel + initial_pos_guess * weight_initial + orig_box[:3] * weight_orig
-        #     optimized_yaw = circular_weighted_mean(
-        #         np.array([rel_yaw_guess, initial_yaw_guess, orig_box[6]]), 
-        #         np.array([weight_rel, weight_initial, weight_orig])
-        #     )
-
-        #     velocity = (optimized_position - last_optimized_position) / dt
-        #     speed = np.linalg.norm(velocity[:2])
-
-        #     if speed < self.heading_speed_thresh_ms:
-        #         optimized_yaw = last_optimized_yaw
+        #     optimized_position = last_optimized_position + t_flow
+        #     optimized_yaw = wrap_angle(last_optimized_yaw + flow_yaw)
 
         #     pose = np.eye(4)
         #     pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, optimized_yaw], float)).as_matrix()
         #     pose[:3, 3] = optimized_position
         #     optimized_poses.append(pose)
 
-        #     # Update for next iteration
-        #     last_velocity = (optimized_position - last_optimized_position) / dt
-        #     last_angular_velocity = (optimized_yaw - last_optimized_yaw) / dt
-
         #     last_optimized_position = np.copy(optimized_position)
         #     last_optimized_yaw = np.copy(optimized_yaw)
+
+        # spline_poses = compute_spline_poses(self.timestamps, optimized_poses)
+        # spline_vecs = np.stack([PoseKalmanFilter.transform_to_pose_vector(x) for x in spline_poses], axis=0)
+        # orig = np.stack([PoseKalmanFilter.transform_to_pose_vector(x) for x in optimized_poses], axis=0)
+
+        for i in range(1, n_frames):
+            R_rel, t_rel, icp_cost_rel, iou_rel, _, _ = self.get_or_compute_relative_pose(
+                points_list[i-1], points_list[i], 
+                last_optimized_position,
+                (i-1, i)
+            )
+    
+            rel_yaw = Rotation.from_matrix(R_rel).as_rotvec()[2]
+            rel_yaw_guess = wrap_angle(last_optimized_yaw + rel_yaw)
+
+            if i == 1:
+                R_init, t_init, icp_cost_initial, iou_initial = R_rel, t_rel, icp_cost_rel, iou_rel
+            else:
+                R_init, t_init, icp_cost_initial, iou_initial, _, _ = self.get_or_compute_relative_pose(
+                    points_list[0], points_list[i], 
+                    initial_position,
+                    (0, i)
+                )
+
+            initial_yaw_guess = wrap_angle(initial_yaw + Rotation.from_matrix(R_init).as_rotvec()[2])
+
+            R_flow, t_flow = self.get_or_compute_relative_pose_flow(points_list[i-1], flow_list[i-1], last_optimized_position, (i-1, i))
+            flow_positions.append(last_optimized_position + t_flow)
+            flow_yaw_guess = wrap_angle(last_optimized_yaw + Rotation.from_matrix(R_flow).as_rotvec()[2])
+
+
+            # box_relative_transform = np.linalg.inv(boxes_poses[i]) @ boxes_poses[i-1]
+            # R_box = box_relative_transform[:3, :3]
+            # t_box = box_relative_transform[:3, 3]
+
+            # A = points_list[i-1].copy() - last_optimized_position
+            # A0 = points_list[0].copy() - initial_position
+
+            # rel_points = (R_rel @ A.T).T + t_rel + last_optimized_position
+            # init_points = (R_init @ A0.T).T + t_init + initial_position
+            # flow_points = (R_flow @ A.T).T + t_flow + last_optimized_position
+            # box_points = (R_box @ A.T).T + t_box + last_optimized_position
+
+            # flow_points2 = points_list[i-1] + flow_list[i-1]
+
+            # # compute distances
+            # next_tree: cKDTree = self.trees[i]
+            # rel_distances, _ = next_tree.query(rel_points)
+            # init_distances, _ = next_tree.query(init_points)
+            # flow_distances, _ = next_tree.query(flow_points)
+            # box_distances, _ = next_tree.query(box_points)
+
+            # flow_distances2, _ = next_tree.query(flow_points2)
+
+            # print("flow_distances", flow_distances.min(), flow_distances.mean(), flow_distances.max())
+            # print("flow_distances2", flow_distances2.min(), flow_distances2.mean(), flow_distances2.max())
+
+            # mean_distance_rel = rel_distances.mean()
+            # mean_distance_init = init_distances.mean()
+            # mean_distance_flow = flow_distances.mean()
+            # mean_distance_box = box_distances.mean()
+
+            # if mean_distance_flow > 3:
+            #     print("flow is quite large...")
+            #     print("t_flow", t_flow)
+            #     print("t_rel", t_rel)
+            #     print("t_box", t_box)
+
+            # print(f"{float(mean_distance_rel)=:.3f} {float(mean_distance_init)=:.3f} {float(mean_distance_flow)=:.3f} {float(mean_distance_box)=:.3f}")
+
+            mean_distance_rel = 0
+            mean_distance_init = 0
+            mean_distance_flow = 0
+            mean_distance_box = 0
+
+            # pose guesses
+            rel_pos_guess = last_optimized_position + t_rel
+            initial_pos_guess = initial_position + t_init
+            flow_pos_guess = last_optimized_position + t_flow
+
+            # compute boxes for each
+            box_rel = np.concatenate([rel_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), rel_yaw_guess.reshape(1)], axis=0)
+            box_init = np.concatenate([initial_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), initial_yaw_guess.reshape(1)], axis=0)
+            box_flow = np.concatenate([flow_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), flow_yaw_guess.reshape(1)], axis=0)
+            box_orig = boxes[i]
+
+            box_mask_rel = ConvexHullObject.points_in_box(box_rel, points_list[i], ret_mask=True)
+            box_mask_init = ConvexHullObject.points_in_box(box_init, points_list[i], ret_mask=True)
+            box_mask_orig = ConvexHullObject.points_in_box(box_orig, points_list[i], ret_mask=True)
+            box_mask_flow = ConvexHullObject.points_in_box(box_flow, points_list[i], ret_mask=True)
+
+            box_iou_rel = box_mask_rel.sum() / box_mask_rel.size
+            box_iou_init = box_mask_init.sum() / box_mask_rel.size
+            box_iou_orig = box_mask_orig.sum() / box_mask_rel.size
+            box_iou_flow = box_mask_flow.sum() / box_mask_flow.size
+
+            # Compute current velocities
+            dt = (timestamps[i] - timestamps[i-1]) * 1e-9
+            velocity_rel = (rel_pos_guess - last_optimized_position) / dt
+            velocity_init = (initial_pos_guess - last_optimized_position) / dt
+            velocity_box = (box_orig[:3] - last_optimized_position) / dt
+            velocity_flow = (flow_pos_guess - last_optimized_position) / dt
+
+            # Smoothness penalties
+            lambda_smooth = 0.1  # Tunable parameter
+            smooth_cost_rel = lambda_smooth * np.linalg.norm(velocity_rel - last_velocity)**2 
+            smooth_cost_init = lambda_smooth * np.linalg.norm(velocity_init - last_velocity)**2
+            smooth_cost_orig = lambda_smooth * np.linalg.norm(velocity_box - last_velocity)**2
+            smooth_cost_flow = lambda_smooth * np.linalg.norm(velocity_flow - last_velocity)**2
+
+            # iou_cost_rel = (1.0 - iou_rel)
+            # iou_cost_initial = (1.0 - iou_initial)
+
+
+            # weight between the two
+            # total_cost_rel = icp_cost_rel + smooth_cost_rel + iou_cost_rel
+            # total_cost_init = icp_cost_initial + smooth_cost_init + iou_cost_initial
+            total_cost_rel = (1.0 - box_iou_rel) + smooth_cost_rel + mean_distance_rel
+            total_cost_init = (1.0 - box_iou_init) + smooth_cost_init + mean_distance_init
+            total_cost_orig = (1.0 - box_iou_orig) + smooth_cost_orig + mean_distance_box
+            total_cost_flow = (1.0 - box_iou_flow) + smooth_cost_flow + mean_distance_flow
+
+            weight_rel = 1.0 / (total_cost_rel + 1e-6)
+            weight_initial = 1.0 / (total_cost_init + 1e-6)
+            weight_orig = 1.0 / (total_cost_orig + 1e-6)
+            weight_flow = 1.0 / (total_cost_flow + 1e-6)
+
+            total_weight = weight_rel + weight_initial + weight_orig + weight_flow
+            weight_rel /= total_weight
+            weight_initial /= total_weight
+            weight_orig /= total_weight
+            weight_flow /= total_weight
+
+            print(f"{float(weight_rel)=} {float(weight_initial)=} {float(weight_orig)=} {float(weight_flow)=}")
+
+            optimized_position = rel_pos_guess * weight_rel + initial_pos_guess * weight_initial + box_orig[:3] * weight_orig + weight_flow * flow_pos_guess
+            optimized_yaw = circular_weighted_mean(
+                np.array([rel_yaw_guess, initial_yaw_guess, box_orig[6], flow_yaw_guess]), 
+                np.array([weight_rel, weight_initial, weight_orig, weight_flow])
+            )
+
+            velocity = (optimized_position - last_optimized_position) / dt
+            speed = np.linalg.norm(velocity[:2])
+
+            if speed < self.heading_speed_thresh_ms:
+                optimized_yaw = last_optimized_yaw
+
+            pose = np.eye(4)
+            pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, optimized_yaw], float)).as_matrix()
+            pose[:3, 3] = optimized_position
+            optimized_poses.append(pose)
+
+            # Update for next iteration
+            last_velocity = (optimized_position - last_optimized_position) / dt
+            last_angular_velocity = (optimized_yaw - last_optimized_yaw) / dt
+
+            last_optimized_position = np.copy(optimized_position)
+            last_optimized_yaw = np.copy(optimized_yaw)
 
         self.optimized_poses = optimized_poses
 

@@ -66,6 +66,7 @@ from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
     save_depth_buffer_colorized,
     voxel_sampling_fast,
 )
+from lion.unsupervised_core.convex_hull_tracker.global_tracker import GlobalTracker
 from lion.unsupervised_core.rotate_iou_cpu_eval import rotate_iou_cpu_eval
 from lion.unsupervised_core.tracker.box_op import register_bbs
 
@@ -1088,7 +1089,7 @@ class OWLViTAlphaShapeMFCF:
         tracker: ConvexHullKalmanTracker,
         lidar_tree: cKDTree,
         search_radius:float =100.0
-    ) -> List[Dict]:
+    ) -> List[ConvexHullObject]:
         """
         Get vision-guided clusters by projecting LiDAR to cameras and filtering by OWLViT boxes.
 
@@ -1134,7 +1135,7 @@ class OWLViTAlphaShapeMFCF:
         point_features = np.concatenate([points, flow], axis=1)
 
         cmp_lbl = 0
-        for eps in [0.25, 0.5]:
+        for eps in [1.0]:
             components_labels, n_components = fast_connected_components(point_features, eps=eps, min_samples=self.min_component_points)
 
             for cmp_lbl_ in range(n_components):
@@ -1166,12 +1167,15 @@ class OWLViTAlphaShapeMFCF:
                 elif sorted_dims[2] > 20: 
                     continue
 
+
+                centre = cmp_points.mean(axis=0)
+            
+                if np.linalg.norm(centre[:2]) > 75:
+                    continue # TODO: config -> too far
+
                 if mask.sum() > self.min_component_points:
                     mesh = trimesh.convex.convex_hull(cmp_points)
                     centre = mesh.centroid
-
-                    if np.linalg.norm(centre[:2]) > 75:
-                        continue # TODO: config -> too far
 
                     component_original_points.append(cmp_points)
                     component_meshes.append(mesh)
@@ -1262,8 +1266,8 @@ class OWLViTAlphaShapeMFCF:
         ]
 
 
-        instance_buffers = self._get_instance_buffers(component_meshes, camera_models, timestamp_city_SE3_ego_dict, sweep_camera_name_timestamps, timestamp_ns)
-        # instance_buffers = None
+        # instance_buffers = self._get_instance_buffers(component_meshes, camera_models, timestamp_city_SE3_ego_dict, sweep_camera_name_timestamps, timestamp_ns)
+        instance_buffers = None
 
 
         # add confirmed tracklets
@@ -1644,31 +1648,31 @@ class OWLViTAlphaShapeMFCF:
         uniform_semantic_features = np.ones((768,), dtype=np.float32)
         uniform_semantic_features = uniform_semantic_features / np.linalg.norm(uniform_semantic_features)
 
-        # for cmp_label in non_assigned_clusters:
-        #     mask = (lidar_connected_components_labels == cmp_label)
+        for cmp_label in non_assigned_clusters:
+            component_3d_points = component_original_points[cmp_label]
+            component_flow = component_flows[cmp_label]
 
-        #     component_3d_points = points[mask].copy()
+            if len(component_3d_points) < self.min_component_points:
+                continue
 
-        #     if len(component_3d_points) < self.min_component_points:
-        #         continue
+            component_3d_points_city = city_SE3_ego_lidar_t.transform_point_cloud(
+                component_3d_points
+            )
 
-        #     component_3d_points_city = city_SE3_ego_lidar_t.transform_point_cloud(
-        #         component_3d_points
-        #     )
+            obj = ConvexHullObject(
+                original_points=component_3d_points_city,
+                flow=component_flow,
+                confidence=0.0,
+                iou_2d=0.0,
+                objectness_score=0.0,
+                feature=np.zeros((768,), float),
+                timestamp=timestamp_ns,
+                source="raw"
+            )
 
-        #     obj = ConvexHullObject(
-        #         original_points=component_3d_points_city,
-        #         confidence=0.0,
-        #         iou_2d=0.0,
-        #         objectness_score=0.0,
-        #         feature=uniform_semantic_features,
-        #         timestamp=timestamp_ns,
-        #         source="cluster"
-        #     )
-
-        #     if obj.original_points is not None:
-        #         num_no_box += 1
-        #         vision_clusters.append(obj)
+            if obj.original_points is not None:
+                num_no_box += 1
+                vision_clusters.append(obj)
             
 
         total = num_w_box + num_no_box
@@ -2028,6 +2032,8 @@ class OWLViTAlphaShapeMFCF:
         all_pose = []
         all_timestamps = []
 
+        global_tracker = GlobalTracker()
+
         tracker = ConvexHullKalmanTracker(debug=True)
 
         class_features = torch.load("/home/uqdetche/lidar_longtail_mining/lion/tools/class_features.pt")
@@ -2092,9 +2098,75 @@ class OWLViTAlphaShapeMFCF:
 
         print(f"{len(flow_per_timestamp)=}")
 
+        n_frames = min(1000, len(infos))
+
+        all_labels = []
+        all_pose = []
+
+        for i in trange(n_frames, desc=f"Global optimization"):
+            pose = infos[i]['pose']
+
+            # 2. Load OWLViT predictions for all cameras (exhaustive)
+            timestamp_ns = infos[i]["timestamp_ns"]
+            assert timestamp_ns is not None, infos[i].keys()
+
+            if timestamp_ns not in flow_per_timestamp:
+                print(f"{timestamp_ns=} not in {flow_per_timestamp}")
+                continue
+
+            # Load city SE3 ego transformations
+            timestamp_city_SE3_ego_dict = read_city_SE3_ego(log_dir=log_dir)
+
+            # ego transformation (ego -> city)
+            city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[timestamp_ns]
+
+            pcl_ego = points_per_timestamp[timestamp_ns]
+            is_ground = gm_per_timestamp[timestamp_ns]
+            flow_ego = flow_per_timestamp[timestamp_ns]
+
+            is_not_ground = ~is_ground
+
+            pcl_ego = pcl_ego[is_not_ground]
+            flow_ego = flow_ego[is_not_ground]
+
+            pcl_ego_pred = pcl_ego + flow_ego
+
+            pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
+            pcl_ego_pred_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego_pred)
+
+            flow = pcl_ego_pred_city_1 - pcl_city_1
+
+            # create lidar tree
+            lidar_tree = cKDTree(pcl_city_1)
+
+            assert len(flow) == len(pcl_ego), f"{flow.shape=} {pcl_ego.shape=}"
+
+            # TODO: project tracks and see if align with boxes...
+            vision_guided_clusters = self._get_vision_guided_clusters(
+                pcl_ego,
+                flow,
+                [],
+                camera_name_timestamps,
+                timestamp_ns,
+                camera_models,
+                timestamp_city_SE3_ego_dict,
+                tracker,
+                lidar_tree
+            )
+
+            global_tracker.add_objects(vision_guided_clusters, timestamp_ns)
+
+            all_pose.append(pose)
+            all_labels.append([x.box for x in vision_guided_clusters])
+
+        global_tracker.calculate()
+        # exit()
+
+        smooth_tracker = TrackSmooth(self.dataset_cfg.GeneratorConfig)
+        smooth_tracker.tracking(all_labels, all_pose)
 
 
-        for i in trange(min(500, len(infos)), desc=f"Generating hybrid alpha shapes"):
+        for i in trange(n_frames, desc=f"Generating hybrid alpha shapes"):
             # 1. Load temporal LiDAR window
             aggregated_points = None
             # aggregated_points, cur_points = self._load_temporal_lidar_window(i, infos)
@@ -2262,19 +2334,41 @@ class OWLViTAlphaShapeMFCF:
 
             tracks = tracker.tracks
 
-            for obj in vision_guided_clusters:
-                box = obj.box
-                center_xy = box[:2]
-                length = box[3]
-                width = box[4]
-                yaw = box[6]
+            objs, ids, cls, dif = smooth_tracker.get_current_frame_objects_and_cls(i)
 
-                # all_boxes.append(box)
-                # all_labels.append("vision_cluster")
-                # all_box_types.append("box_cluster")
+            for box, box_id in zip(objs, ids):
+
+                all_boxes.append(box)
+                all_labels.append(f"smooth_tracker_{box_id}")
+                all_box_types.append("smooth_tracker")
 
                 # Get rotated box corners
-                corners = get_rotated_box(center_xy, length, width, yaw)
+                corners = get_box_bev_corners(box)
+
+                color = "purple"
+
+                obj_polygon = patches.Polygon(
+                    corners,
+                    linewidth=1,
+                    edgecolor=color,
+                    facecolor="none",
+                    alpha=0.7,
+                    linestyle="-",
+                )
+                ax.add_patch(obj_polygon)
+
+            for obj in vision_guided_clusters:
+                box = obj.box
+
+                all_boxes.append(box)
+                all_labels.append("vision_cluster")
+                all_box_types.append("box_cluster")
+
+                # ax.text(box[0], box[1], f"({box[0]:.2f}, {box[1]:.2f})", fontsize=12)
+
+
+                # Get rotated box corners
+                corners = get_box_bev_corners(box)
 
                 color = "black"
 
@@ -2283,20 +2377,81 @@ class OWLViTAlphaShapeMFCF:
                     linewidth=1,
                     edgecolor=color,
                     facecolor="none",
-                    alpha=1.0,
+                    alpha=0.7,
                     linestyle="-",
                 )
                 ax.add_patch(obj_polygon)
+
+                next_timestamp_ns = timestamp_ns + 1e+8
+                
+                box = obj.to_timestamped_box(next_timestamp_ns)
+
+                # Get rotated box corners
+                corners = get_box_bev_corners(box)
+                obj_polygon = patches.Polygon(
+                    corners,
+                    linewidth=1,
+                    edgecolor="gray",
+                    facecolor="none",
+                    alpha=0.7,
+                    linestyle="--",
+                )
+                ax.add_patch(obj_polygon)
+
+            for track in global_tracker.tracks:
+                positions = track.positions
+                ax.plot(positions[:, 0], positions[:, 1], alpha=0.7, linewidth=1, color="brown")
+
+                # positions = track.optimized_positions
+                # ax.plot(positions[:, 0], positions[:, 1], alpha=0.7, linewidth=1, color="blue", linestyle='dashed')
+
+                ax.plot(track.refined_positions[:, 0], track.refined_positions[:, 1], alpha=0.7, linewidth=1, color="blue", linestyle='dashed')
+
+                ax.plot(track.cumulative_positions[:, 0], track.cumulative_positions[:, 1], alpha=0.7, linewidth=1, color="orange", linestyle='dashed')
+
+
+                for box in track.extrapolate_box([timestamp_ns]):
+
+                    all_boxes.append(box)
+                    all_labels.append(f"global_track_{track.track_id}")
+                    all_box_types.append("global_track.extrapolate_box")
+
+                    # Get rotated box corners
+                    corners = get_box_bev_corners(box)
+                    obj_polygon = patches.Polygon(
+                        corners,
+                        linewidth=1,
+                        edgecolor="brown",
+                        facecolor="none",
+                        alpha=0.7,
+                        linestyle="--",
+                    )
+                    ax.add_patch(obj_polygon)
+
+                for t, box in zip(track.timestamps, track.optimized_boxes):
+                    # if t != timestamp_ns:
+                    #     continue
+                    all_boxes.append(box)
+                    all_labels.append(f"global_track_{track.track_id}_optimized_box")
+                    all_box_types.append("global_track.optimized_boxes")
+
+                    # Get rotated box corners
+                    corners = get_box_bev_corners(box)
+                    obj_polygon = patches.Polygon(
+                        corners,
+                        linewidth=1,
+                        edgecolor="brown",
+                        facecolor="none",
+                        alpha=0.7,
+                        linestyle="-",
+                    )
+                    ax.add_patch(obj_polygon)
+
 
             for track in tracks:
                 if track.is_deleted():
                     continue
                 box = track.to_box()
-                # box = track.last_box
-                center_xy = box[:2]
-                length = box[3]
-                width = box[4]
-                yaw = box[6]
 
 
                 all_boxes.append(box)
@@ -2304,7 +2459,7 @@ class OWLViTAlphaShapeMFCF:
                 all_box_types.append("track.to_box()")
 
                 # Get rotated box corners
-                corners = get_rotated_box(center_xy, length, width, yaw)
+                corners = get_box_bev_corners(box)
 
                 color = "yellow"
                 alpha = 0.5
@@ -2318,9 +2473,9 @@ class OWLViTAlphaShapeMFCF:
                 track_polygon = patches.Polygon(
                     corners,
                     linewidth=2,
-                    edgecolor="brown",
+                    edgecolor=color,
                     facecolor="none",
-                    alpha=alpha,
+                    alpha=0.7,
                     linestyle="-",
                 )
                 ax.add_patch(track_polygon)
@@ -2331,55 +2486,43 @@ class OWLViTAlphaShapeMFCF:
                         all_labels.append(f"spline_box_{track.track_id}")
                         all_box_types.append("spline_box")
 
-                        center_xy = box[:2]
-                        length = box[3]
-                        width = box[4]
-                        yaw = box[6]
 
-                        # Get rotated box corners
-                        corners = get_rotated_box(center_xy, length, width, yaw)
-                        track_polygon = patches.Polygon(
-                            corners,
-                            linewidth=1,
-                            edgecolor="red",
-                            facecolor="none",
-                            alpha=0.7,
-                            linestyle="-",
-                        )
-                        ax.add_patch(track_polygon)
+                        # # Get rotated box corners
+                        # corners = get_box_bev_corners(box)
+                        # track_polygon = patches.Polygon(
+                        #     corners,
+                        #     linewidth=1,
+                        #     edgecolor="red",
+                        #     facecolor="none",
+                        #     alpha=0.7,
+                        #     linestyle="-",
+                        # )
+                        # ax.add_patch(track_polygon)
 
                 if track.optimized_boxes is not None:
                     for box in track.optimized_boxes[-1:]:
-                        center_xy = box[:2]
-                        length = box[3]
-                        width = box[4]
-                        yaw = box[6]
 
                         all_boxes.append(box)
                         all_labels.append(f"optimized_track_{track.track_id}")
                         all_box_types.append("optimized_box")
 
-                        # Get rotated box corners
-                        corners = get_rotated_box(center_xy, length, width, yaw)
-                        track_polygon = patches.Polygon(
-                            corners,
-                            linewidth=1,
-                            edgecolor=color,
-                            facecolor="none",
-                            alpha=0.7,
-                            linestyle="--",
-                        )
-                        ax.add_patch(track_polygon)
+                        # # Get rotated box corners
+                        # corners = get_box_bev_corners(box)
+                        # track_polygon = patches.Polygon(
+                        #     corners,
+                        #     linewidth=1,
+                        #     edgecolor=color,
+                        #     facecolor="none",
+                        #     alpha=0.7,
+                        #     linestyle="--",
+                        # )
+                        # ax.add_patch(track_polygon)
 
                 # if track.spline_boxes is not None:
                 #     for box in track.spline_boxes[-1:]:
-                #         center_xy = box[:2]
-                #         length = box[3]
-                #         width = box[4]
-                #         yaw = box[6]
 
                 #         # Get rotated box corners
-                #         corners = get_rotated_box(center_xy, length, width, yaw)
+                #         corners = get_box_bev_corners(box)
                 #         track_polygon = patches.Polygon(
                 #             corners,
                 #             linewidth=1,
@@ -2395,34 +2538,25 @@ class OWLViTAlphaShapeMFCF:
                     
                     boxes = track.extrapolate_box([timestamp_ns]) # use the track timestamps rather than all...
                     for box in boxes:
-                        center_xy = box[:2]
-                        length = box[3]
-                        width = box[4]
-                        yaw = box[6]
-
                         
                         all_boxes.append(box)
                         all_labels.append(f"extrapolate_box_track_{track.track_id}")
                         all_box_types.append("extrapolated_box")
 
-                        # Get rotated box corners
-                        corners = get_rotated_box(center_xy, length, width, yaw)
-                        track_polygon = patches.Polygon(
-                            corners,
-                            linewidth=1,
-                            edgecolor="purple",
-                            facecolor="none",
-                            alpha=0.5,
-                            linestyle="--",
-                        )
-                        ax.add_patch(track_polygon)
+                        # # Get rotated box corners
+                        # corners = get_box_bev_corners(box)
+                        # track_polygon = patches.Polygon(
+                        #     corners,
+                        #     linewidth=1,
+                        #     edgecolor="purple",
+                        #     facecolor="none",
+                        #     alpha=0.5,
+                        #     linestyle="--",
+                        # )
+                        # ax.add_patch(track_polygon)
 
                     # if track.path_box is not None:
                     #     box = track.path_box
-                    #     center_xy = box[:2]
-                    #     length = box[3]
-                    #     width = box[4]
-                    #     yaw = box[6]
 
 
                     #     all_boxes.append(box)
@@ -2430,7 +2564,7 @@ class OWLViTAlphaShapeMFCF:
                     #     all_box_types.append("path_box")
 
                     #     # Get rotated box corners
-                    #     corners = get_rotated_box(center_xy, length, width, yaw)
+                    #     corners = get_box_bev_corners(box)
                     #     track_polygon = patches.Polygon(
                     #         corners,
                     #         linewidth=1,
@@ -2472,13 +2606,9 @@ class OWLViTAlphaShapeMFCF:
                         all_box_types.append("history_motion_box")
 
                         box = history_motion_box
-                        center_xy = box[:2]
-                        length = box[3]
-                        width = box[4]
-                        yaw = box[6]
 
                         # Get rotated box corners
-                        corners = get_rotated_box(center_xy, length, width, yaw)
+                        corners = get_box_bev_corners(box)
                         track_polygon = patches.Polygon(
                             corners,
                             linewidth=1,
@@ -2500,13 +2630,9 @@ class OWLViTAlphaShapeMFCF:
                 # if track.is_confirmed():
                 #     next_timestamp_ns = timestamp_ns + 1e+8
                 #     box = track.extrapolate_kalman_box(next_timestamp_ns)
-                #     center_xy = box[:2]
-                #     length = box[3]
-                #     width = box[4]
-                #     yaw = box[6]
 
                 #     # Get rotated box corners
-                #     corners = get_rotated_box(center_xy, length, width, yaw)
+                #     corners = get_box_bev_corners(box)
                 #     track_polygon = patches.Polygon(
                 #         corners,
                 #         linewidth=1,
@@ -2566,10 +2692,18 @@ class OWLViTAlphaShapeMFCF:
 
                 if len(track.flow_positions) > 0:
                     positions = np.stack(track.flow_positions, axis=0)
-                    ax.plot(positions[:, 0], positions[:, 1], alpha=alpha, linewidth=2, color="black")
+                    ax.plot(positions[:, 0], positions[:, 1], alpha=0.4, linewidth=1, color="black")
                     # ax.scatter(positions[:, 0], positions[:, 1], alpha=alpha, linewidth=2, color="black")
 
             ax.set_aspect("equal")
+            # import matplotlib.ticker as plticker
+            # loc = plticker.MultipleLocator(base=5.0)
+            # ax.xaxis.set_major_locator(loc)
+            # ax.yaxis.set_major_locator(loc)
+
+            # Add the grid
+            # ax.grid(which='major', axis='both', linestyle='-')
+            
             ax.grid(True, alpha=0.3)
             ax.set_xlabel("X (meters)", fontsize=12)
             ax.set_ylabel("Y (meters)", fontsize=12)
@@ -2605,9 +2739,28 @@ class OWLViTAlphaShapeMFCF:
                 ious = rotate_iou_cpu_eval(gt_lidar_boxes, all_boxes).reshape(
                     gt_lidar_boxes.shape[0], all_boxes.shape[0], 2
                 )
-                ious = ious[:, :, 0]
+                ious_3d = ious[:, :, 0]
+                ious_2d = ious[:, :, 1]
+
+                ious = ious_3d.copy()
+
+                # dists = np.linalg.norm(gt_lidar_boxes[np.newaxis, :, :3] - all_boxes[:, np.newaxis, :3])
+                dists = cdist(gt_lidar_boxes, all_boxes)
+                print("dists", dists.shape, dists.min(), dists.max())
+
+                closest_gt = dists.min(axis=1)
+                print("closest_gt", closest_gt.shape, len(gt_lidar_boxes), len(all_boxes))
+                print('closest_gt', closest_gt.min(), closest_gt.max())
+
+
+                print("ious", ious.min(), ious.max())
+                print("ious_2d", ious_2d.min(), ious_2d.max())
 
                 idx = np.argmax(ious, axis=1)
+                assert len(idx) == len(gt_lidar_boxes), f"{ious.shape=} {gt_lidar_boxes.shape=}"
+                ious_best_gt = ious[np.arange(len(gt_lidar_boxes)), idx] 
+                print("ious_best_gt", ious_best_gt.shape)
+                print("ious_best_gt", ious_best_gt.min(), ious_best_gt.max())
                 votes = []
                 for i, j in enumerate(idx):
                     if ious[i, j] > 0.1:
@@ -2704,13 +2857,10 @@ class OWLViTAlphaShapeMFCF:
 
             # for track in tracks:
             #     box = track.to_box()
-            #     center_xy = box[:2]
-            #     length = box[3]
-            #     width = box[4]
-            #     yaw = box[6]
+
 
             #     # Get rotated box corners
-            #     corners = get_rotated_box(center_xy, length, width, yaw)
+            #     corners = get_box_bev_corners(box)
                 
             #     color_name = "yellow"
             #     alpha = 0.3
@@ -2907,7 +3057,7 @@ class OWLViTAlphaShapeMFCF:
 
                 # box = apply_pose_to_box(world_to_ego, box)
                 print("world box", box)
-                box = register_bbs(box.reshape(1, 7), world_to_ego)[0]
+                box = register_bbs(box.copy().reshape(1, 7), world_to_ego)[0]
                 print("ego box", box)
 
                 infos[frame_id]["outline_box"].append(box)
@@ -2991,13 +3141,9 @@ class OWLViTAlphaShapeMFCF:
 
         #     for obj in objects:
         #         box = obj.box
-        #         center_xy = box[:2]
-        #         length = box[3]
-        #         width = box[4]
-        #         yaw = box[6]
 
         #         # Get rotated box corners
-        #         corners = get_rotated_box(center_xy, length, width, yaw)
+        #         corners = get_box_bev_corners(box)
 
         #         det_polygon = patches.Polygon(
         #             corners,
@@ -3016,13 +3162,9 @@ class OWLViTAlphaShapeMFCF:
         #     alpha_shapes = []
         #     for track in tracks:
         #         box = track.to_box()
-        #         center_xy = box[:2]
-        #         length = box[3]
-        #         width = box[4]
-        #         yaw = box[6]
 
         #         # Get rotated box corners
-        #         corners = get_rotated_box(center_xy, length, width, yaw)
+        #         corners = get_box_bev_corners(box)
 
         #         corners3d = get_rotated_3d_box_corners(box)
 
