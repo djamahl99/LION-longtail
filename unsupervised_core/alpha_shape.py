@@ -2098,7 +2098,7 @@ class OWLViTAlphaShapeMFCF:
 
         print(f"{len(flow_per_timestamp)=}")
 
-        n_frames = min(1000, len(infos))
+        n_frames = min(10, len(infos))
 
         all_labels = []
         all_pose = []
@@ -2347,15 +2347,15 @@ class OWLViTAlphaShapeMFCF:
 
                 color = "purple"
 
-                obj_polygon = patches.Polygon(
-                    corners,
-                    linewidth=1,
-                    edgecolor=color,
-                    facecolor="none",
-                    alpha=0.7,
-                    linestyle="-",
-                )
-                ax.add_patch(obj_polygon)
+                # obj_polygon = patches.Polygon(
+                #     corners,
+                #     linewidth=1,
+                #     edgecolor=color,
+                #     facecolor="none",
+                #     alpha=0.7,
+                #     linestyle="-",
+                # )
+                # ax.add_patch(obj_polygon)
 
             for obj in vision_guided_clusters:
                 box = obj.box
@@ -2400,14 +2400,33 @@ class OWLViTAlphaShapeMFCF:
 
             for track in global_tracker.tracks:
                 positions = track.positions
-                ax.plot(positions[:, 0], positions[:, 1], alpha=0.7, linewidth=1, color="brown")
+                # ax.plot(positions[:, 0], positions[:, 1], alpha=0.7, linewidth=1, color="brown")
 
                 # positions = track.optimized_positions
                 # ax.plot(positions[:, 0], positions[:, 1], alpha=0.7, linewidth=1, color="blue", linestyle='dashed')
 
-                ax.plot(track.refined_positions[:, 0], track.refined_positions[:, 1], alpha=0.7, linewidth=1, color="blue", linestyle='dashed')
+                # ax.plot(track.refined_positions[:, 0], track.refined_positions[:, 1], alpha=0.7, linewidth=1, color="green", linestyle='dashed')
+                ax.plot(track.refined_positions2[:, 0], track.refined_positions2[:, 1], alpha=0.7, linewidth=1, color="green", linestyle='-')
 
                 ax.plot(track.cumulative_positions[:, 0], track.cumulative_positions[:, 1], alpha=0.7, linewidth=1, color="orange", linestyle='dashed')
+
+                mesh = track.to_mesh(timestamp_ns)
+                if mesh is not None:
+                    vertices_3d = mesh.vertices
+                    vertices_2d = vertices_3d[:, :2]
+
+                    hull = ConvexHull(vertices_2d)
+                    vertices_2d = vertices_2d[hull.vertices]
+
+                    # Create polygon patch for alpha shape
+                    polygon = patches.Polygon(
+                        vertices_2d,
+                        linewidth=3,
+                        edgecolor="purple",
+                        facecolor="none",
+                        alpha=0.7,
+                    )
+                    ax.add_patch(polygon)    
 
 
                 for box in track.extrapolate_box([timestamp_ns]):
@@ -2421,16 +2440,16 @@ class OWLViTAlphaShapeMFCF:
                     obj_polygon = patches.Polygon(
                         corners,
                         linewidth=1,
-                        edgecolor="brown",
+                        edgecolor="purple",
                         facecolor="none",
-                        alpha=0.7,
+                        alpha=0.3,
                         linestyle="--",
                     )
                     ax.add_patch(obj_polygon)
 
                 for t, box in zip(track.timestamps, track.optimized_boxes):
-                    # if t != timestamp_ns:
-                    #     continue
+                    if t != timestamp_ns:
+                        continue
                     all_boxes.append(box)
                     all_labels.append(f"global_track_{track.track_id}_optimized_box")
                     all_box_types.append("global_track.optimized_boxes")
@@ -2575,21 +2594,21 @@ class OWLViTAlphaShapeMFCF:
                     #     )
                     #     ax.add_patch(track_polygon)
 
-                    for ellipse_params in track.ellipses[-1:]:
-                        lw = np.linalg.norm(track.lwh) # big enough to cover?
+                    # for ellipse_params in track.ellipses[-1:]:
+                    #     lw = np.linalg.norm(track.lwh) # big enough to cover?
 
-                        cx, cy, cz, a, b, h, theta = ellipse_params
+                    #     cx, cy, cz, a, b, h, theta = ellipse_params
 
-                        ellipse_box = ellipse_params.copy()
-                        ellipse_box[3:5] *= 2
+                    #     ellipse_box = ellipse_params.copy()
+                    #     ellipse_box[3:5] *= 2
 
-                        all_boxes.append(ellipse_box)
-                        all_labels.append(f"ellipse_track_{track.track_id}")
-                        all_box_types.append("ellipse_box")
+                    #     all_boxes.append(ellipse_box)
+                    #     all_labels.append(f"ellipse_track_{track.track_id}")
+                    #     all_box_types.append("ellipse_box")
 
-                        x_outline, y_outline = draw_ellipse_outline(cx, cy, a, b, theta)
+                    #     x_outline, y_outline = draw_ellipse_outline(cx, cy, a, b, theta)
 
-                        plt.plot(x_outline, y_outline, 'b-', linewidth=1, alpha=0.3)
+                    #     plt.plot(x_outline, y_outline, 'b-', linewidth=1, alpha=0.3)
 
                     optimized_motion_box = track.optimized_motion_box()
                     history_motion_box = track.optimized_motion_box(history=True)

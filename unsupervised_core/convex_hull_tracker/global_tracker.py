@@ -1,7 +1,8 @@
 import cProfile
 import io
 import pstats
-from collections import Counter
+import time
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -14,6 +15,7 @@ from scipy.sparse import csr_array
 from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.transform import Rotation
+from shapely.geometry import MultiPoint, Polygon, box
 from tqdm import tqdm
 
 from lion.unsupervised_core.box_utils import *
@@ -115,205 +117,8 @@ class GlobalTrack:
         return R_flow, t_flow
 
 
-    def compute_poses_(self):
-        timestamps = [x.timestamp for x in self.history]
-        n_frames = len(timestamps)
-
-        points_list = []
-        flow_list = []
-        boxes = np.stack([x.box for x in self.history], axis=0)
-
-
-        # use initial pose as reference
-        ref_pose_vector = PoseKalmanFilter.box_to_pose_vector(boxes[0])
-        ref_pose_matrix = PoseKalmanFilter.box_to_transform(boxes[0])
-        world_to_object = np.linalg.inv(ref_pose_matrix)
-
-        boxes_poses = [PoseKalmanFilter.box_to_transform(box) for box in boxes]
-
-
-        last_position = ref_pose_vector[:3].copy()
-        initial_position = ref_pose_vector[:3].copy()
-        last_yaw = ref_pose_vector[3].copy()
-        initial_yaw = ref_pose_vector[3].copy()
-        last_velocity = np.zeros(3)
-
-        # Collect world points and centers
-        for i, timestamp_ns in enumerate(timestamps):
-            obj: ConvexHullObject = self.history[i]
-            world_points = obj.original_points
-
-            points_list.append(world_points)
-            flow_list.append(obj.flow)
-
-        optimized_poses = [ref_pose_matrix]
-
-        last_optimized_yaw = np.copy(last_yaw)
-        last_optimized_position = np.copy(last_position)
-
-        flow_positions = [last_optimized_position]
-
-        for i in range(1, n_frames):
-            R_rel, t_rel, icp_cost_rel, _, _ = self.get_or_compute_relative_pose(
-                points_list[i-1], points_list[i], 
-                last_optimized_position,
-                (i-1, i)
-            )
-    
-            rel_yaw = Rotation.from_matrix(R_rel).as_rotvec()[2]
-            rel_yaw_guess = wrap_angle(last_optimized_yaw + rel_yaw)
-
-            if i == 1:
-                R_init, t_init, icp_cost_initial = R_rel, t_rel, icp_cost_rel
-            else:
-                R_init, t_init, icp_cost_initial, _, _ = self.get_or_compute_relative_pose(
-                    points_list[0], points_list[i], 
-                    initial_position,
-                    (0, i)
-                )
-
-            initial_yaw_guess = wrap_angle(initial_yaw + Rotation.from_matrix(R_init).as_rotvec()[2])
-
-            R_flow, t_flow = self.get_or_compute_relative_pose_flow(points_list[i-1], flow_list[i-1], last_optimized_position, (i-1, i))
-            flow_positions.append(last_optimized_position + t_flow)
-            flow_yaw_guess = wrap_angle(last_optimized_yaw + Rotation.from_matrix(R_flow).as_rotvec()[2])
-
-
-            mean_distance_rel = 0
-            mean_distance_init = 0
-            mean_distance_flow = 0
-            mean_distance_box = 0
-
-            # pose guesses
-            rel_pos_guess = last_optimized_position + t_rel
-            initial_pos_guess = initial_position + t_init
-            flow_pos_guess = last_optimized_position + t_flow
-
-            # compute boxes for each
-            box_rel = np.concatenate([rel_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), rel_yaw_guess.reshape(1)], axis=0)
-            box_init = np.concatenate([initial_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), initial_yaw_guess.reshape(1)], axis=0)
-            box_flow = np.concatenate([flow_pos_guess.reshape(3), boxes[i, 3:6].reshape(3), flow_yaw_guess.reshape(1)], axis=0)
-            box_orig = boxes[i]
-
-            box_mask_rel = ConvexHullObject.points_in_box(box_rel, points_list[i], ret_mask=True)
-            box_mask_init = ConvexHullObject.points_in_box(box_init, points_list[i], ret_mask=True)
-            box_mask_orig = ConvexHullObject.points_in_box(box_orig, points_list[i], ret_mask=True)
-            box_mask_flow = ConvexHullObject.points_in_box(box_flow, points_list[i], ret_mask=True)
-
-            box_iou_rel = box_mask_rel.sum() / box_mask_rel.size
-            box_iou_init = box_mask_init.sum() / box_mask_rel.size
-            box_iou_orig = box_mask_orig.sum() / box_mask_rel.size
-            box_iou_flow = box_mask_flow.sum() / box_mask_flow.size
-
-            # Compute current velocities
-            dt = (timestamps[i] - timestamps[i-1]) * 1e-9
-            velocity_rel = (rel_pos_guess - last_optimized_position) / dt
-            velocity_init = (initial_pos_guess - last_optimized_position) / dt
-            velocity_box = (box_orig[:3] - last_optimized_position) / dt
-            velocity_flow = (flow_pos_guess - last_optimized_position) / dt
-
-            # Smoothness penalties
-            lambda_smooth = 0.1  # Tunable parameter
-            smooth_cost_rel = lambda_smooth * np.linalg.norm(velocity_rel - last_velocity)**2 
-            smooth_cost_init = lambda_smooth * np.linalg.norm(velocity_init - last_velocity)**2
-            smooth_cost_orig = lambda_smooth * np.linalg.norm(velocity_box - last_velocity)**2
-            smooth_cost_flow = lambda_smooth * np.linalg.norm(velocity_flow - last_velocity)**2
-
-            # iou_cost_rel = (1.0 - iou_rel)
-            # iou_cost_initial = (1.0 - iou_initial)
-
-
-            # weight between the two
-            # total_cost_rel = icp_cost_rel + smooth_cost_rel + iou_cost_rel
-            # total_cost_init = icp_cost_initial + smooth_cost_init + iou_cost_initial
-            total_cost_rel = (1.0 - box_iou_rel) + smooth_cost_rel + mean_distance_rel
-            total_cost_init = (1.0 - box_iou_init) + smooth_cost_init + mean_distance_init
-            total_cost_orig = (1.0 - box_iou_orig) + smooth_cost_orig + mean_distance_box
-            total_cost_flow = (1.0 - box_iou_flow) + smooth_cost_flow + mean_distance_flow
-
-            weight_rel = 1.0 / (total_cost_rel + 1e-6)
-            weight_initial = 1.0 / (total_cost_init + 1e-6)
-            weight_orig = 1.0 / (total_cost_orig + 1e-6)
-            weight_flow = 1.0 / (total_cost_flow + 1e-6)
-
-            total_weight = weight_rel + weight_initial + weight_orig + weight_flow
-            weight_rel /= total_weight
-            weight_initial /= total_weight
-            weight_orig /= total_weight
-            weight_flow /= total_weight
-
-            print(f"{float(weight_rel)=} {float(weight_initial)=} {float(weight_orig)=} {float(weight_flow)=}")
-
-            optimized_position = rel_pos_guess * weight_rel + initial_pos_guess * weight_initial + box_orig[:3] * weight_orig + weight_flow * flow_pos_guess
-            optimized_yaw = circular_weighted_mean(
-                np.array([rel_yaw_guess, initial_yaw_guess, box_orig[6], flow_yaw_guess]), 
-                np.array([weight_rel, weight_initial, weight_orig, weight_flow])
-            )
-
-            velocity = (optimized_position - last_optimized_position) / dt
-            speed = np.linalg.norm(velocity[:2])
-
-            if speed < self.heading_speed_thresh_ms:
-                optimized_yaw = last_optimized_yaw
-
-            pose = np.eye(4)
-            pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, optimized_yaw], float)).as_matrix()
-            pose[:3, 3] = optimized_position
-            optimized_poses.append(pose)
-
-            # Update for next iteration
-            last_velocity = (optimized_position - last_optimized_position) / dt
-            last_angular_velocity = (optimized_yaw - last_optimized_yaw) / dt
-
-            last_optimized_position = np.copy(optimized_position)
-            last_optimized_yaw = np.copy(optimized_yaw)
-
-        self.optimized_poses = optimized_poses
-
-        self.optimized_positions = np.array([x[:3, 3].copy() for x in optimized_poses])
-        self.flow_positions = flow_positions
-
-        # update points
-        # Now transform points to object-centric coordinates
-        object_centric_points = []
-        optimized_boxes = []
-
-
-        # for convex_hull_obj, obj_pose, inlier_indices in zip(self.history, optimized_poses, inlier_indices_list):
-        for convex_hull_obj, obj_pose in zip(self.history, optimized_poses):
-            # Get world points
-            # world_points = convex_hull_obj.original_points[inlier_indices]
-            world_points = convex_hull_obj.original_points
-
-            # Transform to object-centric: multiply by inverse of object pose
-            world_to_object = np.linalg.inv(obj_pose)
-            object_points = points_rigid_transform(world_points, world_to_object)
-
-            object_centric_points.append(object_points)
-
-            dims_mins, dims_maxes = object_points.min(axis=0), object_points.max(axis=0)
-            l, w, h = dims_maxes - dims_mins
-
-            yaw = Rotation.from_matrix(optimized_poses[i][:3, :3]).as_rotvec()[2]
-            x, y, z = optimized_poses[i][:3, 3]
-            box = np.array([x, y, z, l, w, h, yaw])
-            optimized_boxes.append(box)
-
-        self.optimized_boxes = optimized_boxes
-
-        self.box_predictor.update(timestamps, self.optimized_boxes)
-
-        self.object_points = np.concatenate(object_centric_points, axis=0)
-        self.object_points = voxel_sampling_fast(self.object_points, 0.05, 0.05, 0.05)
-
-        self.object_mesh = trimesh.convex.convex_hull(self.object_points)
-
-        dims_mins, dims_maxes = self.object_points.min(axis=0), self.object_points.max(axis=0)
-        self.lwh = dims_maxes - dims_mins
-
-        return optimized_poses
-
     def compute_poses(self):
+        print(f"compute_poses {self.track_id=}")
         timestamps = [x.timestamp for x in self.history]
         n_frames = len(timestamps)
 
@@ -329,6 +134,14 @@ class GlobalTrack:
 
         last_optimized_position = points_list[0].mean(axis=0)
         initial_position = last_optimized_position.copy()
+        last_flow_position = self.history[0].box[:3].copy()
+        last_flow_yaw = self.history[0].box[6]
+
+        last_flow_pose = np.eye(4)
+        last_flow_pose[:3, 3] = last_flow_position
+        last_flow_pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, last_flow_yaw])).as_matrix()
+
+        flow_poses = [last_flow_pose]
 
         for i in range(1, n_frames):
             R_rel, t_rel, icp_cost_rel, _, _ = self.get_or_compute_relative_pose(
@@ -337,9 +150,22 @@ class GlobalTrack:
                 (i-1, i)
             )
 
-            # R_flow, t_flow = self.get_or_compute_relative_pose_flow(points_list[i-1], flow_list[i-1], last_optimized_position, (i-1, i))
+            R_flow, t_flow = self.get_or_compute_relative_pose_flow(points_list[i-1], flow_list[i-1], last_optimized_position, (i-1, i))
+
+            flow_position = last_flow_position + t_flow
+            flow_yaw =  wrap_angle(last_flow_yaw + Rotation.from_matrix(R_flow).as_rotvec()[2])
+            
+
+            flow_pose = np.eye(4)
+            flow_pose[:3, 3] = flow_position
+            flow_pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, flow_yaw])).as_matrix()
+
+            flow_poses.append(flow_pose)
+
 
             last_optimized_position = points_list[i].mean()
+            last_flow_position = flow_position
+            last_flow_yaw = flow_yaw
 
         inlier_tallies = [np.zeros((len(x.original_points),), int) for x in self.history]
         print("inlier_tallies", ",".join([f"{x.shape}" for x in inlier_tallies]))
@@ -420,36 +246,11 @@ class GlobalTrack:
 
             object_centric_points.append(object_points)
 
-        # fig, ax = plt.subplots(figsize=(8, 8))
-        # colors = plt.cm.tab20(np.linspace(0, 1, len(object_centric_points)))
-        # for idx, points in enumerate(object_centric_points):
-        #     ax.scatter(
-        #         points[:, 0],
-        #         points[:, 1],
-        #         s=3,
-        #         c=colors[idx],
-        #         label="Lidar Points",
-        #         alpha=0.5,
-        #     )
-
-
-        # ax.set_aspect("equal")
-        # ax.grid(True, alpha=0.3)
-        # ax.set_xlabel("X (meters)", fontsize=12)
-        # ax.set_ylabel("Y (meters)", fontsize=12)
-
-        # plt.tight_layout()
-
-        # save_folder = Path("./global_tracker_object_points/")
-        # save_folder.mkdir(exist_ok=True)
-        # save_path = save_folder / f"track_{self.track_id}.png"
-        # plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        # plt.close()
-
         object_points = np.concatenate(object_centric_points, axis=0)
         mesh: trimesh.Trimesh = trimesh.convex.convex_hull(object_points)
 
         refined_poses1 = []
+
 
         # refine poses
         for i in range(n_frames):
@@ -461,7 +262,13 @@ class GlobalTrack:
             transformed_mesh = mesh.copy().apply_transform(initial_pose)
             
             # R, t, cost = efficient_relative_pose_trimesh(transformed_mesh, cur_mesh, samples=1000)
-            R, t, _, _, _ = relative_object_pose(transformed_mesh.vertices, cur_mesh.vertices)
+            centre = transformed_mesh.centroid
+            verticesi = transformed_mesh.vertices - centre
+            verticesj = cur_mesh.vertices - centre
+            # transformed_points = points_rigid_transform(object_points, initial_pose)
+            # verticesi = cur_points - centre
+            # verticesj = cur_
+            R, t, _, _, _ = relative_object_pose(verticesi, verticesj)
 
             rel_pose = np.eye(4)
             rel_pose[:3, :3] = R
@@ -469,18 +276,16 @@ class GlobalTrack:
 
             cur_pose = rel_pose @ initial_pose
 
-            init_R = initial_pose[:3, :3]
-            init_t = initial_pose[:3, 3]
+            # init_R = initial_pose[:3, :3]
+            # init_t = initial_pose[:3, 3]
 
-            init_yaw = Rotation.from_matrix(init_R).as_rotvec()[2]
+            # init_yaw = Rotation.from_matrix(init_R).as_rotvec()[2]
 
             cur_R = cur_pose[:3, :3]
             cur_t = cur_pose[:3, 3]
 
             cur_yaw = Rotation.from_matrix(cur_R).as_rotvec()[2]
 
-            print('cur_t', cur_t, 'init_t', init_t)
-            print('cur_yaw', cur_yaw, 'init_yaw', init_yaw)
 
             refined_poses1.append(cur_pose)
 
@@ -504,7 +309,7 @@ class GlobalTrack:
         # # merged_points = np.concatenate(merged_points, axis=0)
         # print('merged_points', merged_points.shape)
         
-        # # Option A: Use alpha shapes instead of convex hull for better shape representation
+        # Option A: Use alpha shapes instead of convex hull for better shape representation
         # reference_mesh: trimesh.Trimesh = trimesh.convex.convex_hull(merged_points)
 
         # reference_position = reference_mesh.centroid
@@ -515,35 +320,235 @@ class GlobalTrack:
         # reference_pose[:3, 3] = reference_position
 
         # print("reference_position", reference_position)
+
+        box_densities = []
+        for convex_hull_obj in self.history:
+            vol = np.prod(convex_hull_obj.box[3:6])
+            n_points = convex_hull_obj.orig_n_points
+
+            density = n_points / vol # points per metre^3
+
+            box_densities.append(density)
+
+        print("box_densities: " + ",".join([f"{x:.3f}" for x in box_densities]))
+
+        reference_idx = np.argmax(box_densities)
+        reference_points = points_list[reference_idx]
+        reference_mesh1: trimesh.Trimesh = trimesh.convex.convex_hull(reference_points)
+
+        # find relative poses to the reference points
+        for i in range(0, n_frames):
+            if i == reference_idx:
+                continue
+
+            centre = points_list[i].mean(axis=0)
+            R_rel, t_rel, icp_cost_rel, _, _ = self.get_or_compute_relative_pose(
+                points_list[i], points_list[reference_idx], 
+                centre,
+                (i, reference_idx)
+            )
+
+            points = points_list[i].copy() - centre
+            transformed_points = (R_rel @ points.T).T + t_rel + centre
+
+            _, distances, _ = trimesh.proximity.closest_point(
+                reference_mesh1, transformed_points
+            )
+
+            print(f"transformed_points dists {distances.min():.2f} {distances.mean():.2f} {distances.max():.2f}")
+
+            reference_points = np.concatenate([reference_points, transformed_points], axis=0)
+
+        reference_mesh2: trimesh.Trimesh = trimesh.convex.convex_hull(reference_points)
+
+        reference_yaw = self.history[reference_idx].box[6]
+        reference_position = self.history[reference_idx].box[:3]
+
+        reference_pose = np.eye(4)
+        reference_pose[:3, :3] = Rotation.from_rotvec(np.array([0.0, 0.0, reference_yaw], float)).as_matrix()
+        reference_pose[:3, 3] = reference_position
+
+        reference_to_object = np.linalg.inv(reference_pose)
+        reference_object_points = points_rigid_transform(reference_points, reference_to_object)
+
+        refined_poses21 = []
+        refined_poses22 = []
+        refined_poses_p2m = []
+
+        # reference_object_mesh = reference_mesh.copy().apply_transform(reference_to_object)
         
-        # refined_poses2 = []
+        for i in range(n_frames):
+            initial_pose = cumulative_poses[i].copy()
+            cur_points = points_list[i] #[inlier_indices_list[i]]
+            
+
+            initial_rel_pose = np.eye(4)
+
+            initial_rel_position = reference_position - initial_pose[:3, 3]
+            initial_yaw = Rotation.from_matrix(initial_pose[:3, :3]).as_rotvec()[2]
+            initial_rel_yaw = wrap_angle(reference_yaw - initial_yaw)
+
+            initial_rel_pose[:3, :3] = Rotation.from_rotvec(np.array([0, 0, initial_rel_yaw])).as_matrix()
+            initial_rel_pose[:3, 3] = initial_rel_position
+
+
+            print(f"{reference_pose[:3, 3]=} {initial_rel_pose[:3, 3]=} {initial_pose[:3, 3]=}")
+            print(f"{initial_rel_position=} {initial_rel_yaw=}")
+
+            reference_object_mesh = reference_mesh1.copy()
+            relative_transform_p2m = self.refine_pose_point_to_mesh(
+                cur_points, reference_object_mesh, initial_rel_pose
+            )
+
+            refined_pose_p2m = reference_pose @ np.linalg.inv(relative_transform_p2m)
+            refined_poses_p2m.append(refined_pose_p2m)
+
+            initial_pose_inv = np.linalg.inv(initial_pose)
+            pointsi = points_rigid_transform(cur_points, initial_pose_inv)
+            pointsj = points_rigid_transform(reference_points, initial_pose_inv)
+
+            R, t, inliersi, inliersj, cost = relative_object_pose(pointsi, pointsj)
+
+            relative_transform = np.eye(4)
+            relative_transform[:3, :3] = R
+            relative_transform[:3, 3] = t
+
+            print("relative_transform_p2m[:3, 3]", relative_transform_p2m[:3, 3])
+            print('relative_transform[:3, 3]', relative_transform[:3, 3])
+
+            # # Apply inverse to get current frame pose in world coordinates
+            refined_pose21 = reference_pose @ np.linalg.inv(relative_transform)
+
+            # this gets them in the right frame for reference pose but they are not "aligned" if that makes sense?
+            refined_pose22 = initial_pose @ relative_transform
+
+            print('initial_pose[:3, 3]', initial_pose[:3, 3])
+            print('refined_pose21[:3, 3]', refined_pose21[:3, 3])
+            print('refined_pose22[:3, 3]', refined_pose22[:3, 3])
+
+
+            # print("refined_pose", PoseKalmanFilter.transform_to_pose_vector(refined_pose))
+            # print("refined_pose_p2m", PoseKalmanFilter.transform_to_pose_vector(refined_pose_p2m))
+            
+            refined_poses21.append(refined_pose21)
+            refined_poses22.append(refined_pose22)
+
+        refined_poses3 = []
+        refined_poses3_p2m = []
+        refined_poses3_trimesh = []
+        ref_object_points = points_rigid_transform(reference_points, np.linalg.inv(reference_pose))
+        reference_object_mesh = trimesh.convex.convex_hull(ref_object_points)
         
-        # for i in range(n_frames):
-        #     initial_pose = cumulative_poses[i].copy()
-        #     cur_points = points_list[i][inlier_indices_list[i]]
+        for i in range(len(points_list)):
+            cur_points = points_list[i]
 
-        #     initial_rel_pose = reference_pose @ np.linalg.inv(initial_pose)
+            # Use the pose from the previous refinement step as the starting point
+            cur_world_to_object = np.linalg.inv(refined_poses21[i])
+            cur_points_object = points_rigid_transform(cur_points, cur_world_to_object)
 
-        #     print(f"{reference_pose[:3, 3]=} {initial_rel_pose[:3, 3]=} {initial_pose[:3, 3]=}")
+            # Find the final correction needed to align the local points to the canonical model
+            R, t, _, _, _ = relative_object_pose(
+                cur_points_object, ref_object_points, debug=False
+            )
 
-        #     # transformed_mesh = mesh.copy().apply_transform(initial_pose)
+            initial_rel_pose = np.eye(4)
+            initial_rel_pose[:3, :3] = R
+            initial_rel_pose[:3, 3] = t
+
+            object_relative_pose_p2m = self.refine_pose_point_to_mesh(
+                cur_points_object, reference_object_mesh, initial_rel_pose
+            )
+
+            object_relative_pose_trimesh, _, _ = trimesh.registration.icp(cur_points_object, ref_object_points, initial=initial_rel_pose, threshold=1e-05, max_iterations=20)
+
+            # Check if rotation is reasonable (not too large)
+            angle = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
+            if angle > np.pi/6:  # More than 30 degrees seems suspicious
+                print(f"Large rotation detected: {np.degrees(angle):.1f}°")
+              
+            # Build the correction transform
+            object_relative_pose = np.eye(4)
+            object_relative_pose[:3, :3] = R
+            object_relative_pose[:3, 3] = t
+
+            if i == reference_idx:
+                print('reference object_relative_pose should be zero...')
+                print("object_relative_pose", object_relative_pose)
+                print("object_relative_pose_p2m", object_relative_pose_p2m)
+                print("object_relative_pose_trimesh", object_relative_pose_trimesh)
+                print("initial_rel_pose", initial_rel_pose)
+
+                # object_relative_pose = np.eye(4)
+                # object_relative_pose_p2m = np.eye(4)
+
+            # Combine the correction with the previous inverse pose to get a new, better inverse pose
+            new_world_to_object_pose = object_relative_pose @ cur_world_to_object
+
+            # Invert the final inverse pose to get the correct forward pose for rendering in the world
+            correct_final_pose = np.linalg.inv(new_world_to_object_pose)
+
+            new_world_to_object_pose_p2m = object_relative_pose_p2m @ cur_world_to_object
+            correct_final_pose_p2m = np.linalg.inv(new_world_to_object_pose_p2m)
+
+            new_world_to_object_pose_trimesh = object_relative_pose_trimesh @ cur_world_to_object
+            correct_final_pose_trimesh = np.linalg.inv(new_world_to_object_pose_trimesh)
+
+            refined_poses3_trimesh.append(correct_final_pose_trimesh)
+
+            correct_pose = refined_poses21[i] @ object_relative_pose
+
+            print("correct_final_pose", PoseKalmanFilter.transform_to_pose_vector(correct_final_pose))
+            print("correct_pose", PoseKalmanFilter.transform_to_pose_vector(correct_pose))
+            print('correct_final_pose_p2m', PoseKalmanFilter.transform_to_pose_vector(correct_final_pose_p2m))
             
-        #     # Instead of mesh-to-mesh, do point-to-mesh registration
-        #     # This is more robust for sparse LiDAR data
-        #     refined_pose = self.refine_pose_point_to_mesh(
-        #         cur_points, reference_mesh, initial_rel_pose
-        #     )
+            refined_poses3.append(correct_final_pose)
+            refined_poses3_p2m.append(correct_final_pose_p2m)
 
-        #     print("initial_rel_pose[:3, 3]", initial_rel_pose[:3, 3])
-        #     print("refined_pose[:3, 3]", refined_pose[:3, 3])
-            
-        #     refined_poses2.append(refined_pose)
+        object_centric_points_pose21 = []
+        object_centric_points_pose22 = []
+        object_centric_points_pose3 = []
+        object_centric_points_cumpose = []
+        object_centric_points_flowpose = []
+        object_centric_points_pose3p2m = []
+        object_centric_points_pose3_trimesh = []
 
-        refined_poses2 = [np.eye(4)] * len(cumulative_poses)
+        
 
-        for ref_pose1, ref_pose2, cumulative_pose in zip(refined_poses1, refined_poses2, cumulative_poses):
-            out = []
-            for cur_name, cur_pose in [('ref_pose1', ref_pose1), ('ref_pose2', ref_pose2), ('cumulative_pose', cumulative_pose)]:
+        for i in range(n_frames):
+            cur_points = points_list[i].copy()
+            object_centric_points_pose21.append(points_rigid_transform(cur_points, np.linalg.inv(refined_poses21[i])))
+            object_centric_points_pose22.append(points_rigid_transform(cur_points, np.linalg.inv(refined_poses22[i])))
+            object_centric_points_pose3.append(points_rigid_transform(cur_points, np.linalg.inv(refined_poses3[i])))
+            object_centric_points_cumpose.append(points_rigid_transform(cur_points, np.linalg.inv(cumulative_poses[i])))
+            object_centric_points_flowpose.append(points_rigid_transform(cur_points, np.linalg.inv(flow_poses[i])))
+            object_centric_points_pose3p2m.append(points_rigid_transform(cur_points, np.linalg.inv(refined_poses3_p2m[i])))
+            object_centric_points_pose3_trimesh.append(points_rigid_transform(cur_points, np.linalg.inv(refined_poses3_trimesh[i])))
+
+        object_centric_points_pose21 = np.concatenate(object_centric_points_pose21, axis=0)
+        object_centric_points_pose22 = np.concatenate(object_centric_points_pose22, axis=0)
+        object_points_pose3 = np.concatenate(object_centric_points_pose3, axis=0)
+        object_centric_points_cumpose = np.concatenate(object_centric_points_cumpose, axis=0)
+        object_centric_points_flowpose = np.concatenate(object_centric_points_flowpose, axis=0)
+        object_centric_points_pose3p2m = np.concatenate(object_centric_points_pose3p2m, axis=0)
+        object_centric_points_pose3_trimesh = np.concatenate(object_centric_points_pose3_trimesh, axis=0)
+
+        iou_refined_poses21 = compute_bev_iou(reference_object_points, object_centric_points_pose21)
+        iou_refined_poses22 = compute_bev_iou(reference_object_points, object_centric_points_pose22)
+        iou_refined_poses3 = compute_bev_iou(reference_object_points, object_points_pose3)
+        iou_cumulative_pose = compute_bev_iou(reference_object_points, object_centric_points_cumpose)
+        iou_flowpose = compute_bev_iou(reference_object_points, object_centric_points_flowpose)
+        iou_refined_pose3p2m = compute_bev_iou(reference_object_points, object_centric_points_pose3p2m)
+        iou_refined_pose3_trimesh = compute_bev_iou(reference_object_points, object_centric_points_pose3_trimesh)
+
+        self.canonical_ious = dict(iou_refined_poses21=iou_refined_poses21, iou_refined_poses22=iou_refined_poses22,
+            iou_refined_poses3=iou_refined_poses3, iou_cumulative_pose=iou_cumulative_pose, 
+            iou_flowpose=iou_flowpose, iou_refined_pose3p2m=iou_refined_pose3p2m, iou_refined_pose3_trimesh=iou_refined_pose3_trimesh)
+
+        mesh: trimesh.Trimesh = trimesh.convex.convex_hull(object_centric_points_pose3_trimesh)
+
+        for orig_pos, ref_pose1, ref_pose22, ref_pose_p2m, cumulative_pose, flow_pose, ref_pose3 in zip(self.positions, refined_poses1, refined_poses22, refined_poses_p2m, cumulative_poses, flow_poses, refined_poses3):
+            out = [f"original position: {orig_pos[0]:.2f} {orig_pos[1]:.2f} {orig_pos[2]:.2f}"]
+            for cur_name, cur_pose in [('ref_pose1', ref_pose1), ('ref_pose22', ref_pose22), ('ref_pose_p2m', ref_pose_p2m), ('cumulative_pose', cumulative_pose), ('flow_pose', flow_pose), ('ref_pose3', ref_pose3)]:
                 cur_R = cur_pose[:3, :3]
                 cur_t = cur_pose[:3, 3]
 
@@ -553,78 +558,395 @@ class GlobalTrack:
     
             print(",".join(out))
 
-        self.refined_positions = np.stack([x[:3, 3] for x in refined_poses1], axis=0)
+        orig_positions = self.positions
+
+        self.flow_positions = np.stack([x[:3, 3] for x in flow_poses], axis=0)
+
+        self.refined_positions = np.stack([x[:3, 3] for x in refined_poses3_trimesh], axis=0)
+        self.refined_positions2 = np.stack([x[:3, 3] for x in refined_poses22], axis=0)
+        self.refined_positions_p2m = np.stack([x[:3, 3] for x in refined_poses_p2m], axis=0)
         self.cumulative_positions = np.stack([x[:3, 3] for x in cumulative_poses], axis=0)
 
+        refined_mse = np.linalg.norm(self.refined_positions - orig_positions, axis=1).mean()
+        refined2_mse = np.linalg.norm(self.refined_positions2 - orig_positions, axis=1).mean()
+        refined_p2m_mse = np.linalg.norm(self.refined_positions_p2m - orig_positions, axis=1).mean()
+        cumulative_mse = np.linalg.norm(self.cumulative_positions - orig_positions, axis=1).mean()
+
+        print(f"{refined_mse=:.2f} {refined2_mse=:.2f} {refined_p2m_mse=:.2f} {cumulative_mse}")
+
+        dims_mins, dims_maxes = object_centric_points_pose3_trimesh.min(axis=0), object_centric_points_pose3_trimesh.max(axis=0)
+        self.lwh = dims_maxes - dims_mins
+        l, w, h = self.lwh
+
         optimized_boxes = []
-        for convex_hull_obj, obj_pose in zip(self.history, refined_poses1):
-            # Transform to object-centric: multiply by inverse of object pose
-            object_points = points_rigid_transform(mesh.vertices, obj_pose)
-
-            dims_mins, dims_maxes = object_points.min(axis=0), object_points.max(axis=0)
-            l, w, h = dims_maxes - dims_mins
-
+        for i, obj_pose in enumerate(refined_poses3_trimesh):
             yaw = Rotation.from_matrix(obj_pose[:3, :3]).as_rotvec()[2]
             x, y, z = obj_pose[:3, 3]
             box = np.array([x, y, z, l, w, h, yaw])
+
             optimized_boxes.append(box)
 
         self.optimized_boxes = optimized_boxes
 
-        self.box_predictor.update(timestamps, [x.box for x in self.history])
+        self.box_predictor.update(timestamps, optimized_boxes)
 
         # self.object_points = np.concatenate(object_centric_points, axis=0)
-        self.object_points = mesh.vertices
-
+        self.object_centric_points_pose3_trimesh = object_centric_points_pose3_trimesh
         self.object_mesh = mesh
 
-        dims_mins, dims_maxes = self.object_points.min(axis=0), self.object_points.max(axis=0)
-        self.lwh = dims_maxes - dims_mins
+        # plot all the meshes and the merged meshes etc
+        fig, (ax1, ax2) = plt.subplots(nrows=2, figsize=(8, 4))
 
-    def refine_pose_point_to_mesh(self, points, mesh, initial_rel_pose, max_iterations=20):
+        ### ############################################################
+
+        
+
+
+        points_dict = {
+            "pose21": object_centric_points_pose21,
+            # "pose22": object_centric_points_pose22,
+            "pose3": object_points_pose3,
+            # "cumpose": object_centric_points_cumpose,
+            # "flowpose": object_centric_points_flowpose,
+            "pose3p2m": object_centric_points_pose3p2m,
+            "pose3_trimesh": object_centric_points_pose3_trimesh,
+        }
+
+        object_points_color = plt.cm.tab20c(np.linspace(0, 1, len(points_dict)))
+
+        for idx, (points_name, object_points) in enumerate(points_dict.items()):
+            ax2.scatter(
+                object_points[:, 0],
+                object_points[:, 1],
+                s=3,
+                c=object_points_color[idx],
+                label=points_name,
+                alpha=0.5,
+            )
+
+            hull = ConvexHull(object_points[:, :2])
+            vertices_2d = object_points[hull.vertices, :2]
+
+            polygon = patches.Polygon(
+                vertices_2d,
+                linewidth=2,
+                edgecolor=object_points_color[idx],
+                facecolor="none",
+                # label=points_name,
+                alpha=0.5,
+            )
+            ax2.add_patch(polygon)   
+
+        ax2.legend()
+            
+        # ax2.scatter(
+        #     object_points[:, 0],
+        #     object_points[:, 1],
+        #     s=3,
+        #     c="black",
+        #     label="Lidar Points",
+        #     alpha=0.5,
+        # )
+
+        # hull = ConvexHull(object_points[:, :2])
+        # vertices_2d = object_points[hull.vertices, :2]
+
+        # polygon = patches.Polygon(
+        #     vertices_2d,
+        #     linewidth=2,
+        #     edgecolor="black",
+        #     facecolor="none",
+        #     alpha=0.7,
+        # )
+        # ax2.add_patch(polygon)   
+        
+        # ax2.scatter(
+        #     object_points_pose3[:, 0],
+        #     object_points_pose3[:, 1],
+        #     s=3,
+        #     c="red",
+        #     label="Lidar Points",
+        #     alpha=0.5,
+        # )
+        
+        # hull = ConvexHull(object_points_pose3[:, :2])
+        # vertices_2d = object_points_pose3[hull.vertices, :2]
+
+        # polygon = patches.Polygon(
+        #     vertices_2d,
+        #     linewidth=2,
+        #     edgecolor="red",
+        #     facecolor="none",
+        #     alpha=0.7,
+        # )
+        # ax2.add_patch(polygon)   
+        
+        # ax2.scatter(
+        #     object_centric_points_cumpose[:, 0],
+        #     object_centric_points_cumpose[:, 1],
+        #     s=3,
+        #     c="green",
+        #     label="Lidar Points",
+        #     alpha=0.5,
+        # )
+
+
+        # hull = ConvexHull(object_centric_points_cumpose[:, :2])
+        # vertices_2d = object_centric_points_cumpose[hull.vertices, :2]
+
+        # polygon = patches.Polygon(
+        #     vertices_2d,
+        #     linewidth=2,
+        #     edgecolor="green",
+        #     facecolor="none",
+        #     alpha=0.7,
+        # )
+        # ax2.add_patch(polygon)   
+
+        # ax2.scatter(
+        #     object_centric_points_flowpose[:, 0],
+        #     object_centric_points_flowpose[:, 1],
+        #     s=3,
+        #     c="purple",
+        #     label="Lidar Points",
+        #     alpha=0.5,
+        # )
+
+
+        # hull = ConvexHull(object_centric_points_flowpose[:, :2])
+        # vertices_2d = object_centric_points_flowpose[hull.vertices, :2]
+
+        # polygon = patches.Polygon(
+        #     vertices_2d,
+        #     linewidth=2,
+        #     edgecolor="purple",
+        #     facecolor="none",
+        #     alpha=0.7,
+        # )
+        # ax2.add_patch(polygon)   
+
+
+        # ax2.scatter(
+        #     object_centric_points_pose3p2m[:, 0],
+        #     object_centric_points_pose3p2m[:, 1],
+        #     s=3,
+        #     c="yellow",
+        #     label="Lidar Points",
+        #     alpha=0.5,
+        # )
+
+
+        # hull = ConvexHull(object_centric_points_pose3p2m[:, :2])
+        # vertices_2d = object_centric_points_pose3p2m[hull.vertices, :2]
+
+        # polygon = patches.Polygon(
+        #     vertices_2d,
+        #     linewidth=2,
+        #     edgecolor="yellow",
+        #     facecolor="none",
+        #     alpha=0.7,
+        # )
+        # ax2.add_patch(polygon)   
+
+
+        ### ############################################################
+        hull = ConvexHull(reference_mesh1.vertices[:, :2])
+        vertices_2d = reference_mesh1.vertices[hull.vertices, :2]
+
+        polygon = patches.Polygon(
+            vertices_2d,
+            linewidth=2,
+            edgecolor="orange",
+            facecolor="none",
+            alpha=0.7,
+        )
+        ax1.add_patch(polygon)    
+
+
+        hull = ConvexHull(reference_mesh2.vertices[:, :2])
+        vertices_2d = reference_mesh2.vertices[hull.vertices, :2]
+
+        polygon = patches.Polygon(
+            vertices_2d,
+            linewidth=2,
+            edgecolor="red",
+            facecolor="none",
+            alpha=0.7,
+        )
+        ax1.add_patch(polygon)    
+
+        colors = plt.cm.tab20(np.linspace(0, 1, n_frames))
+        for frame in range(n_frames):
+            points = points_list[frame]
+
+            ax1.scatter(
+                points[:, 0],
+                points[:, 1],
+                s=3,
+                c=colors[frame],
+                label="Lidar Points",
+                alpha=0.5,
+            )
+            
+            hull = ConvexHull(points[:, :2])
+            vertices_2d = points[hull.vertices, :2]
+
+            polygon = patches.Polygon(
+                vertices_2d,
+                linewidth=2,
+                edgecolor=colors[frame],
+                facecolor="none",
+                alpha=0.7,
+            )
+            ax1.add_patch(polygon)    
+
+        ax1.set_aspect("equal")
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xlabel("X (meters)", fontsize=12)
+        ax1.set_ylabel("Y (meters)", fontsize=12)
+
+        ax2.set_aspect("equal")
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xlabel("X (meters)", fontsize=12)
+        ax2.set_ylabel("Y (meters)", fontsize=12)
+        plt.tight_layout()
+
+
+        save_folder = Path("./compute_poses/")
+        save_folder.mkdir(exist_ok=True)
+        save_path = save_folder / f"track_{self.track_id}.png"
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+
+    def to_mesh(self, timestamp: int):
+        if timestamp in self.timestamps:
+            index = self.timestamps.index(timestamp)
+
+            pose = self.optimized_poses[index]
+
+            mesh = self.object_mesh.copy().apply_transform(pose)
+
+            return mesh
+
+        return None
+
+    def refine_pose_point_to_mesh(self, points, mesh, initial_rel_pose, max_iterations=10):
         """
         Refine pose using point-to-mesh ICP instead of mesh-to-mesh
         """
         current_rel_pose = initial_rel_pose.copy()
+
+        last_mean_error = np.inf
         
-        for iteration in range(max_iterations):
-            # Transform points to current pose
-            transformed_points = points_rigid_transform(points, current_rel_pose)
-            
-            # Find closest points on mesh surface
-            closest_points, distances, triangle_ids = trimesh.proximity.closest_point(
-                mesh, transformed_points
-            )
-            
-            # Filter outliers
-            distance_threshold = np.percentile(distances, 80)
-            inliers = distances < distance_threshold
-            
-            if np.sum(inliers) < 10:  # Need minimum points
-                break
+
+        vertices_3d = mesh.vertices
+        vertices_2d = vertices_3d[:, :2]
+
+        hull = ConvexHull(vertices_2d)
+        vertices_2d = vertices_2d[hull.vertices]
+
+        with tqdm(total=max_iterations, desc="refine_pose_point_to_mesh") as pbar:
+
+            for iteration in range(max_iterations):
+                # Transform points to current pose
+                transformed_points = points_rigid_transform(points, current_rel_pose)
                 
-            # Solve for relative transformation
-            source_pts = transformed_points[inliers]
-            target_pts = closest_points[inliers]
-            
-            # Use your existing ICP solver or a robust one
-            # R_rel, t_rel = self.solve_point_to_point_icp(source_pts, target_pts)
-            # R_rel, t_rel, inliersi, inliersj, cost = relative_object_pose(source_pts, target_pts)
-            R_rel, t_rel = analytical_z_rotation_centered(source_pts, target_pts)
+                # Find closest points on mesh surface
+                # t0 = time.time()
+                closest_points, distances, triangle_ids = trimesh.proximity.closest_point(
+                    mesh, transformed_points
+                )
+                # t1 = time.time()
+                # print(f"trimesh.proximity.closest_point took {(t1-t0):.2f} seconds for {len(transformed_points)} points")
+                
+                # Filter outliers
+                distance_threshold = np.percentile(distances, 80)
+                inliers = distances < distance_threshold
+                
+                if np.sum(inliers) < 10:  # Need minimum points
+                    break
+                    
+                # Solve for relative transformation
+                source_pts = transformed_points[inliers]
+                target_pts = closest_points[inliers]
+                
+                # Use your existing ICP solver or a robust one
+                # R_rel, t_rel = self.solve_point_to_point_icp(source_pts, target_pts)
+                # R_rel, t_rel, inliersi, inliersj, cost = relative_object_pose(source_pts, target_pts)
+                source_centre = source_pts.mean(axis=0)
+                target_centre = target_pts.mean(axis=0)
+                print("source_centre", source_centre)
+                print("target_centre", target_centre)
 
-            
-            # Update pose
-            rel_transform = np.eye(4)
-            rel_transform[:3, :3] = R_rel
-            rel_transform[:3, 3] = t_rel
-            
-            current_rel_pose = rel_transform @ current_rel_pose
+                # fig, ax = plt.subplots(figsize=(4, 4))
 
-            # Check convergence
-            mean_error = np.mean(distances[inliers])
-            if mean_error < 0.02:  # 2cm threshold
-                break
-        
+                # ax.scatter(
+                #     source_pts[:, 0],
+                #     source_pts[:, 1],
+                #     s=3,
+                #     c="blue",
+                #     label="Lidar Points",
+                #     alpha=0.5,
+                # )
+
+                
+                # ax.scatter(
+                #     target_pts[:, 0],
+                #     target_pts[:, 1],
+                #     s=3,
+                #     c="green",
+                #     label="Lidar Points",
+                #     alpha=0.5,
+                # )
+
+
+                # # Create polygon patch for alpha shape
+                # polygon = patches.Polygon(
+                #     vertices_2d,
+                #     linewidth=2,
+                #     edgecolor="purple",
+                #     facecolor="none",
+                #     alpha=0.7,
+                # )
+                # ax.add_patch(polygon)    
+
+                # ax.set_aspect("equal")
+                # plt.tight_layout()
+
+                # save_folder = Path("./refine_pose_point_to_mesh/")
+                # save_folder.mkdir(exist_ok=True)
+                # save_path = save_folder / f"track_{self.track_id}_{iteration}.png"
+                # plt.savefig(save_path, dpi=100, bbox_inches="tight")
+                # plt.close()
+
+
+                R_rel, t_rel = analytical_z_rotation_centered(source_pts, target_pts)
+
+                
+                # Update pose
+                rel_transform = np.eye(4)
+                rel_transform[:3, :3] = R_rel
+                rel_transform[:3, 3] = t_rel
+                
+                current_rel_pose = rel_transform @ current_rel_pose
+
+                # Check convergence
+                mean_error = np.mean(distances[inliers])
+                if abs(mean_error - last_mean_error) < 0.1:  # 10cm threshold
+                    break
+
+                last_mean_error = mean_error
+            
+                pbar.update(1)
+                pbar.set_postfix({
+                    "mean_error": f"{mean_error:.2f}",
+                    "distance_threshold": f"{distance_threshold:.2f}",
+                    "inliers": f"{np.sum(inliers)}/{len(inliers)}",
+                })
+
+            pbar.update(max_iterations)
+
         return current_rel_pose
 
 
@@ -684,7 +1006,7 @@ class GlobalTracker:
         self.object_timestamps.extend(timestamps)
         self.timestamps.append(timestamp)
 
-    def calculate(self):
+    def calculate(self, k=5):
         N = len(self.objects)
         object_timestamps_secs = np.array([x * NANOSEC_TO_SEC for x in self.object_timestamps], float)
 
@@ -724,6 +1046,8 @@ class GlobalTracker:
             for i in np.where(object_timestamps == start_time)[0]:
                 object_i: ConvexHullObject = self.objects[i]
 
+                edge_candidates = []
+
                 for time_j in range(time_i + 1, n_times):
                     end_time = unique_times[time_j]
                     time_j_secs = unique_times_secs[time_j]
@@ -732,9 +1056,6 @@ class GlobalTracker:
                         break
 
                     for j in np.where(object_timestamps == end_time)[0]:
-
-
-
                         assert time_j_secs > time_i_secs
 
                         object_j: ConvexHullObject = self.objects[j]
@@ -746,8 +1067,8 @@ class GlobalTracker:
                         best_semantic_ious[i] = max(best_semantic_ious[i], semantic_iou)
                         best_semantic_ious[j] = max(best_semantic_ious[j], semantic_iou)
 
-                        if semantic_iou < self.min_semantic_threshold:
-                            continue
+                        # if semantic_iou < self.min_semantic_threshold:
+                        #     continue
 
 
                         # between
@@ -755,35 +1076,10 @@ class GlobalTracker:
                         object_i_box_extrapolated_centre = object_i.to_timestamped_box(new_timestamp)
                         object_j_box_extrapolated_centre = object_j.to_timestamped_box(new_timestamp)
 
-                        # # object i timestamp
-                        # object_i_box_extrapolated_left = object_i.to_timestamped_box(object_i.timestamp)
-                        # object_j_box_extrapolated_left = object_j.to_timestamped_box(object_i.timestamp)
-
-                        # # object j timestamp
-                        # object_i_box_extrapolated_right = object_i.to_timestamped_box(object_j.timestamp)
-                        # object_j_box_extrapolated_right = object_j.to_timestamped_box(object_j.timestamp)
-
-
-                        iou_dflt = box_iou_3d(object_i.box, object_j.box)
-                        iou_tmd_centre = box_iou_3d(object_i_box_extrapolated_centre, object_j_box_extrapolated_centre)
-                        # iou_tmd_left = box_iou_3d(object_i_box_extrapolated_left, object_j_box_extrapolated_left)
-                        # iou_tmd_right = box_iou_3d(object_i_box_extrapolated_right, object_j_box_extrapolated_right)
-
-                        iou = max(iou_dflt, iou_tmd_centre)
-
+                        iou = box_iou_3d(object_i_box_extrapolated_centre, object_j_box_extrapolated_centre)
 
                         if iou < self.min_box_iou:
                             continue
-
-                        # R, t, inliersi, inliersj, pose_cost = relative_object_pose(object_i.original_points, object_j.original_points)
-
-                        # relative_pose = np.eye(4)
-                        # relative_pose[:3, :3] = R
-                        # relative_pose[:3, 3] = t
-
-                        # box_transformed = register_bbs(object_i.box.copy().reshape(1, 7), relative_pose)[0]
-
-                        # iou_transformed = box_iou_3d(box_transformed, object_j.box)
 
                         dt1 = (new_timestamp - start_time) * NANOSEC_TO_SEC
                         dt2 = (new_timestamp - end_time) * NANOSEC_TO_SEC
@@ -798,97 +1094,38 @@ class GlobalTracker:
                         points_dists = np.linalg.norm(object_i_points_[:, np.newaxis, :] - object_j_points[np.newaxis, :, :], axis=2)
                         points_dists = points_dists.min(axis=1)
 
-
                         assert points_dists.shape[0] == object_i_points_.shape[0], f"{points_dists.shape=} {object_i_points_.shape=}"
 
                         dist = points_dists.mean()
 
-                        # if (i in close_indices or j in close_indices) and dist < 5.0:
-
-                        #     fig, ax = plt.subplots(figsize=(4,4))
-
-                        #     ax.scatter(
-                        #         object_i.original_points[:, 0],
-                        #         object_i.original_points[:, 1],
-                        #         s=3,
-                        #         c="red",
-                        #         label="Lidar Points",
-                        #         alpha=0.5,
-                        #     )
-                        #     ax.scatter(
-                        #         object_i_points_[:, 0],
-                        #         object_i_points_[:, 1],
-                        #         s=3,
-                        #         c="blue",
-                        #         label="Lidar Points",
-                        #         alpha=0.7,
-                        #     )
-                        #     ax.scatter(
-                        #         object_j_points[:, 0],
-                        #         object_j_points[:, 1],
-                        #         s=3,
-                        #         c="green",
-                        #         label="Lidar Points",
-                        #         alpha=0.7,
-                        #     )
-
-
-                        #     ax.set_aspect("equal")
-                        #     ax.grid(True, alpha=0.3)
-                        #     ax.set_xlabel("X (meters)", fontsize=12)
-                        #     ax.set_ylabel("Y (meters)", fontsize=12)
-                        #     # ax.title(f"dist:{dist:.2f} {semantic_iou:.2f} {iou:.2f}")
-                        #     ax.set_title(f"dist:{dist:.2f} semantic_iou:{semantic_iou:.2f} iou:{iou:.2f} time: {(time_j_secs - time_i_secs):.2f}", fontsize=14, fontweight="bold")
-                        #     xy1 = np.minimum(object_i_points_.min(axis=0), object_j_points.min(axis=0))
-                        #     xy2 = np.minimum(object_i_points_.max(axis=0), object_j_points.max(axis=0))
-
-                        #     x1, x2 = np.min(xy1), np.max(xy2)
-
-                        #     # # square
-                        #     # plt.xlim(x1, x2)
-                        #     # plt.ylim(x1, x2)
-
-                        #     plt.tight_layout()
-
-                        #     save_folder = Path("./global_tracker/")
-                        #     save_folder.mkdir(exist_ok=True)
-                        #     save_path = save_folder / f"{i}_{j}.png"
-                        #     plt.savefig(save_path, dpi=150, bbox_inches="tight")
-                        #     plt.close()
-
-
                         dists_all.append(dist)
-
 
                         best_ious[i] = max(best_ious[i], iou)
                         best_ious[j] = max(best_ious[j], iou)
 
-                        # if iou < self.min_box_iou:
-                        #     continue
-
                         if dist > 1.0: # flow distance too far...
                             continue
 
-                        # dist1 = np.linalg.norm(object_i.box[:3] - object_j.box[:3])
-                        # dist2 = np.linalg.norm(object_i_box_extrapolated[:3] - object_j_box_extrapolated[:3])
-                        # dist = (dist1 + dist2) / 2.0
+                        cost = (1.0 - iou) + dist + (1.0 - semantic_iou) + (time_j_secs - time_i_secs)
 
-                        # dist = np.linalg.norm(object_i_box_extrapolated[:3] - object_j_box_extrapolated[:3])
 
-                        cost = (1.0 - iou) + dist + (1.0 - semantic_iou) + (time_j_secs - time_i_secs)*10
-
-                        rows.append(i)
-                        cols.append(j)
-                        costs.append(cost)
+                        edge_candidates.append((j, cost))
 
                         ious.append(iou)
-                        ious_dflt.append(iou_dflt)
-                        ious_tmd_centre.append(iou_tmd_centre)
-                        # ious_tmd_left.append(iou_tmd_left)
-                        # ious_tmd_right.append(iou_tmd_right)
+                        # ious_dflt.append(iou_dflt)
+                        # ious_tmd_centre.append(iou_tmd_centre)
                         semantic_ious.append(semantic_iou)
                         dists.append(dist)
                         time_difference.append(time_j_secs - time_i_secs)
+
+                # find the best 5 candidates
+                edge_candidates.sort(key=lambda x: x[1])
+
+                for j, cost in edge_candidates[:k]:
+                    rows.append(i)
+                    cols.append(j)
+                    costs.append(cost)
+
 
         rows = np.array(rows, int)
         cols = np.array(cols, int)
@@ -898,8 +1135,8 @@ class GlobalTracker:
         graph = csr_array((costs, (rows, cols)), shape=(N, N))
 
         print("ious", np.min(ious), np.mean(ious), np.max(ious))
-        print("ious_dflt", np.min(ious_dflt), np.mean(ious_dflt), np.max(ious_dflt))
-        print("ious_tmd_centre", np.min(ious_tmd_centre), np.mean(ious_tmd_centre), np.max(ious_tmd_centre))
+        # print("ious_dflt", np.min(ious_dflt), np.mean(ious_dflt), np.max(ious_dflt))
+        # print("ious_tmd_centre", np.min(ious_tmd_centre), np.mean(ious_tmd_centre), np.max(ious_tmd_centre))
         # print("ious_tmd_left", np.min(ious_tmd_left), np.mean(ious_tmd_left), np.max(ious_tmd_left))
         # print("ious_tmd_right", np.min(ious_tmd_right), np.mean(ious_tmd_right), np.max(ious_tmd_right))
         print("semantic_ious", np.min(semantic_ious), np.mean(semantic_ious), np.max(semantic_ious))
@@ -908,13 +1145,17 @@ class GlobalTracker:
         print("time_difference", np.min(time_difference), np.mean(time_difference), np.max(time_difference))
         print("best_ious", np.min(best_ious), np.mean(best_ious), np.max(best_ious))
 
-        paths = find_tracks_parallel_dijkstra(graph, self.object_timestamps)
+        all_boxes = [obj.box for obj in self.objects]
+
+        paths = find_tracks_parallel_dijkstra(graph, all_boxes, self.object_timestamps)
 
         track_lengths = []
         track_lengths_ns = []
         truck_paths = []
+        truck_tracks: List[GlobalTrack] = []
         pr = cProfile.Profile()
         pr.enable()
+        canonical_ious = defaultdict(list)
         for track_id, path in enumerate(paths):
             history = [self.objects[i] for i in path]
 
@@ -931,12 +1172,22 @@ class GlobalTracker:
 
             track.compute_poses()
 
+            for iou_name, cur_iou in track.canonical_ious.items():
+                print(f"{iou_name}: {cur_iou:.2f}")
+
+                canonical_ious[iou_name].append(cur_iou)
+
+            for iou_name, ious in canonical_ious.items():
+                print(f"{iou_name}: min: {np.min(ious):.2f} mean: {np.mean(ious):.2f} max: {np.max(ious):.2f}")
+
             self.tracks.append(track)
+
 
             cur_nodes = set(path)
             if len(cur_nodes.intersection(close_indices)) > 0:
                 print("close to truck has path", path)
                 truck_paths.append(path)
+                truck_tracks.append(track)
 
         pr.disable()
 
@@ -950,7 +1201,7 @@ class GlobalTracker:
         fig, ax = plt.subplots(figsize=(8, 8))
 
         colors = plt.cm.tab20(np.linspace(0, 1, len(truck_paths)))
-        for truck_id, path in enumerate(truck_paths):
+        for truck_id, (path, truck_track) in enumerate(zip(truck_paths, truck_tracks)):
 
             for node in path:
                 box = self.objects[node].box
@@ -975,6 +1226,25 @@ class GlobalTracker:
                     label="Lidar Points",
                     alpha=0.5,
                 )
+            
+            for box in truck_track.optimized_boxes:
+                corners = get_box_bev_corners(box)
+                obj_polygon = patches.Polygon(
+                    corners,
+                    linewidth=1,
+                    edgecolor=colors[truck_id],
+                    facecolor="none",
+                    alpha=0.7,
+                    linestyle="dotted",
+                )
+                ax.add_patch(obj_polygon)          
+
+
+            ax.plot(truck_track.positions[:, 0], truck_track.positions[:, 1], alpha=0.7, linewidth=1, color="brown", linestyle='-')
+            ax.plot(truck_track.refined_positions_p2m[:, 0], truck_track.refined_positions_p2m[:, 1], alpha=0.7, linewidth=1, color="purple", linestyle='-')
+            ax.plot(truck_track.flow_positions[:, 0], truck_track.flow_positions[:, 1], alpha=0.7, linewidth=1, color="red", linestyle='-')
+            ax.plot(truck_track.refined_positions2[:, 0], truck_track.refined_positions2[:, 1], alpha=0.7, linewidth=1, color="green", linestyle='-')
+            ax.plot(truck_track.cumulative_positions[:, 0], truck_track.cumulative_positions[:, 1], alpha=0.7, linewidth=1, color="orange", linestyle='-')      
 
 
         ax.set_aspect("equal")
@@ -985,6 +1255,8 @@ class GlobalTracker:
 
         plt.tight_layout()
 
+        plt.xlim(truck_pos[0] + -20, truck_pos[0] + 20)
+        plt.ylim(truck_pos[1] + -20, truck_pos[1] + 20)
 
 
         # save_folder = Path("./global_tracker/")
@@ -1132,7 +1404,7 @@ def reconstruct_path(comp_pred, start_idx, end_idx):
     path.reverse()
     return path
 
-def find_tracks_parallel_dijkstra(graph, timestamps):
+def find_tracks_parallel_dijkstra(graph, all_boxes, timestamps):
     """
     Process all timestamp groups simultaneously, then resolve conflicts
     """
@@ -1142,6 +1414,8 @@ def find_tracks_parallel_dijkstra(graph, timestamps):
     
     unique_times = np.unique(timestamps)
     tidx = 0
+
+    tracks_removed = 0
 
     with tqdm(total=n, desc="Processing nodes find_tracks_parallel_dijkstra") as pbar:
         while available_nodes and tidx < len(unique_times):
@@ -1168,10 +1442,12 @@ def find_tracks_parallel_dijkstra(graph, timestamps):
             )
             
             # Extract non-conflicting tracks
-            tracks, used_nodes = resolve_track_conflicts(
+            tracks, used_nodes, n_removed = resolve_track_conflicts(
                 source_indices, source_nodes, dist_matrix, pred_matrix,
-                available_list, timestamps
+                available_list, timestamps, all_boxes
             )
+
+            tracks_removed += n_removed
             
             all_tracks.extend(tracks)
             available_nodes -= used_nodes
@@ -1188,7 +1464,8 @@ def find_tracks_parallel_dijkstra(graph, timestamps):
             pbar.set_postfix({
                 'remaining': len(available_nodes),
                 'tracks': len(all_tracks),
-                'timestamp_idx': f"{tidx}/{len(unique_times)}"
+                'timestamp_idx': f"{tidx}/{len(unique_times)}",
+                "tracks_removed": tracks_removed
             })
         
         # Handle any remaining nodes
@@ -1198,9 +1475,11 @@ def find_tracks_parallel_dijkstra(graph, timestamps):
     return all_tracks
 
 def resolve_track_conflicts(source_indices, source_nodes, dist_matrix, pred_matrix, 
-                          available_list, timestamps):
+                          available_list, timestamps, all_boxes, iou_threshold: float = 0.5, dist_thresh: float = 0.5):
     unique_times = np.unique(timestamps)
     local_to_position = {local_idx: pos for pos, local_idx in enumerate(source_indices)}
+
+    assert len(timestamps) == len(all_boxes)
     
     time_spans = []
     for start_idx, start_node in zip(source_indices, source_nodes):
@@ -1235,44 +1514,70 @@ def resolve_track_conflicts(source_indices, source_nodes, dist_matrix, pred_matr
                     valid_paths.append((time_span, source_time, max_timestamp, 
                                      cost, path_local, start_idx, last_local_idx))
     
+    position_trees: Dict[int, cKDTree] = {}
+    for t0 in unique_times:
+        indices = np.where(timestamps == t0)[0]
+        box_positions = np.stack([all_boxes[i][:3] for i in indices], axis=0)
+        position_trees[t0] = cKDTree(box_positions)
+
     if valid_paths:
-        valid_paths = sorted(valid_paths, key=lambda x: (x[0], x[3]))
+        # sort longest to shortest time span then min to max cost. (hence negative x[3])
+        valid_paths = sorted(valid_paths, key=lambda x: (x[0], -1.0 * x[3]), reverse=True)
         
         best_paths = []
         used_nodes = set()
 
         path_sets: List[set] = []
+        n_removed = 0
         
         for time_span, source_time, max_timestamp, cost, path_local, start_idx, last_idx in valid_paths:
             path_global = [available_list[i] for i in path_local]
             cur_nodes = set(path_global)
 
-            # best_iou = 0.0
-            # for path_set in path_sets:
-            #     inter = len(path_set.intersection(cur_nodes))
-            #     union = len(path_set.union(cur_nodes))
+            best_iou = 0.0
+            for path_set in path_sets:
+                inter = len(path_set.intersection(cur_nodes))
+                union = len(path_set.union(cur_nodes))
 
-            #     if union == 0.0:
-            #         iou = 0.0
-            #     else:
-            #         iou = inter / union
+                if union == 0.0:
+                    iou = 0.0
+                else:
+                    iou = inter / union
 
-            #     best_iou = max(best_iou, iou)
+                best_iou = max(best_iou, iou)
+
+            overlap = 0
+            for node in cur_nodes:
+                t0 = timestamps[node]
+
+                indices = position_trees[t0].query_ball_point(all_boxes[node][:3], dist_thresh, p=2.0)
+
+                for nbr in indices:
+                    if nbr in used_nodes:
+                        overlap += 1
+                        break
+
+            overlap = overlap / len(cur_nodes)
 
             # print('best_iou', best_iou)
 
             # allow partial overlap, reject complete duplicates
-            if len(cur_nodes.symmetric_difference(used_nodes)) == 0:
-                print("no difference")
-                continue  # All nodes already used - this is a duplicate path
+            # if len(cur_nodes.symmetric_difference(used_nodes)) == 0 or best_iou >= iou_threshold:
+            # if len(cur_nodes.intersection(used_nodes)) > 0:
+            if best_iou >= iou_threshold or overlap >= iou_threshold:
+                used_nodes.update(path_global)
+                path_sets.append(cur_nodes)
+                n_removed += 1
+                continue  # nodes already used - this is a duplicate path
             
             used_nodes.update(path_global)
-            best_paths.append(path_global)
             path_sets.append(cur_nodes)
-        
-        return best_paths, used_nodes
+
+            best_paths.append(path_global)
+
+        return best_paths, used_nodes, n_removed
     
-    return [], set()
+    return [], set(), 0
 
 
 
@@ -1290,3 +1595,24 @@ def efficient_relative_pose_trimesh(mesh1, mesh2, samples=1000):
     t = matrix[:3, 3]
     
     return R, t, cost
+
+def compute_bev_iou(points1, points2) -> float:
+    # Project to BEV (XY plane only)
+    shape1_bev = points1[:, :2]  # Take only X,Y coordinates
+    shape2_bev = points2[:, :2]
+
+    # Create convex hulls in BEV as proxy for alpha shapes
+    # Note: This is a simplification - ideally we'd use actual alpha shapes in 2D
+    hull1 = MultiPoint(shape1_bev).convex_hull
+    hull2 = MultiPoint(shape2_bev).convex_hull
+
+    # Handle degenerate cases (points, lines)
+    if hull1.area == 0 or hull2.area == 0:
+        return 0.0
+
+    # Compute intersection and union
+    intersection = hull1.intersection(hull2).area
+    union = hull1.union(hull2).area
+
+    # Return IoU
+    return intersection / union if union > 0 else 0.0

@@ -1,3 +1,5 @@
+from typing import Optional
+
 import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
@@ -22,8 +24,9 @@ MAX_POINTS = 1024
 NANOSEC_TO_SEC = 1e-9
 
 class ConvexHullObject(object):
-    original_points: np.ndarray = None
-    flow: np.ndarray = None
+    orig_n_points: int
+    original_points: Optional[np.ndarray]
+    flow: np.ndarray
     confidence: float
     objectness_score: float
     iou_2d: float
@@ -31,7 +34,7 @@ class ConvexHullObject(object):
     timestamp: int
     source: str
     box: np.ndarray
-    is_moving: bool = False
+    is_moving: bool
     def __init__(
         self,
         original_points: np.ndarray,
@@ -45,6 +48,9 @@ class ConvexHullObject(object):
     ):
         dims_mins = original_points.min(axis=0)
         dims_maxes = original_points.max(axis=0)
+
+        self.orig_n_points = len(original_points)
+        self.original_points = None
 
         lwh = dims_maxes - dims_mins
 

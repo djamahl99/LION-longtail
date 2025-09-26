@@ -327,7 +327,8 @@ def relative_object_pose(
     tolerance: float = 0.1,
     max_iterations=10,
     debug: bool = False,
-    hungarian: bool =True
+    hungarian: bool =True,
+    initial_pose = None
 ):
     """
     ICP for pre-centered points (assumes both clouds centered at origin)
@@ -350,7 +351,7 @@ def relative_object_pose(
     prev_error = float("inf")
 
     # Track transformation as 4x4 matrix for clarity
-    T_final = np.eye(4)
+    T_final = np.eye(4) if (initial_pose is None or initial_pose.shape != (4,4)) else initial_pose.copy()
 
     matching_func = hungarian_matching if hungarian else bidirectional_matching
 
@@ -399,15 +400,60 @@ def relative_object_pose(
     A_indices = np.where(inlier_mask)[0]
     B_indices = B_indices[inlier_mask]
 
+    # Check if alignment is reasonable
+    mean_distance = np.mean(distances)
+    median_distance = np.median(distances)
+
     if debug:
         print(
             f"final distances {distances.min():.6f} {distances.mean():.6f} {distances.max():.6f}"
         )
 
+    # If alignment is poor, return identity transform
+    if mean_distance > 0.5 or median_distance > 0.3:  # Tune these thresholds
+        print(f"ICP failed: mean_dist={mean_distance:.3f}, median_dist={median_distance:.3f}")
+        # return np.eye(3), np.zeros(3), [], [], float('inf')
+    
+
     final_err = distances.mean()
     # final_err = np.median(distances)
 
     return R_final, t_final, A_indices, B_indices, final_err
+
+def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Z-axis rotation for already-centered points (yaw only)."""
+    
+    t = np.mean(B - A, axis=0)
+
+    A_translated = A + t
+
+    new_distances = np.linalg.norm(B-A_translated, axis=1)
+
+    # inliers = new_distances <= min(0.5, np.quantile(new_distances, 0.75))
+    inliers = new_distances <= np.quantile(new_distances, 0.75)
+    A_translated = A_translated[inliers]
+    B = B[inliers]
+
+    # Extract x and y coordinates for z-axis rotation
+    Ax, Ay = A_translated[:, 0], A_translated[:, 1]  # X,Y → Z-axis rotation (yaw)
+    Bx, By = B[:, 0], B[:, 1]
+
+    # Analytical solution for optimal theta
+    numerator = np.sum(Ax * By - Ay * Bx)  # Note: Ax*By - Ay*Bx
+    denominator = np.sum(Bx * Ax + By * Ay)
+    theta = np.arctan2(numerator, denominator)
+
+    if np.abs(theta) < 0.1:
+        theta = 0.0
+
+    # Z-axis rotation matrix
+    cos_theta, sin_theta = np.cos(theta), np.sin(theta)
+    R = np.array([[cos_theta, -sin_theta, 0], 
+                  [sin_theta,  cos_theta, 0], 
+                  [0,          0,         1]], dtype=np.float32)
+
+
+    return R, t
 
 
 def analytical_y_rotation_centered(
@@ -436,42 +482,6 @@ def analytical_y_rotation_centered(
     # For centered points, translation is just the difference after rotation
     A_rotated = (R @ A.T).T
     t = np.mean(B - A_rotated, axis=0)
-
-    return R, t
-
-def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Z-axis rotation for already-centered points (yaw only)."""
-    
-    t = np.mean(B - A, axis=0)
-
-    A_translated = A + t
-
-    new_distances = np.linalg.norm(B-A_translated, axis=1)
-
-    # inliers = new_distances <= min(0.5, np.quantile(new_distances, 0.75))
-    inliers = new_distances <= np.quantile(new_distances, 0.75)
-    A_translated = A_translated[inliers]
-    B = B[inliers]
-
-    # Extract x and y coordinates for z-axis rotation
-    Ax, Ay = A_translated[:, 0], A_translated[:, 1]  # X,Y → Z-axis rotation (yaw)
-    # Ax, Ay = A[:, 0], A[:, 1]  # X,Y → Z-axis rotation (yaw)
-    Bx, By = B[:, 0], B[:, 1]
-
-    # Analytical solution for optimal theta
-    numerator = np.sum(Bx * Ay - By * Ax)
-    denominator = np.sum(Bx * Ax + By * Ay)
-    theta = np.arctan2(numerator, denominator)
-
-    if np.abs(theta) < 0.1:
-        theta = 0.0
-
-    # Z-axis rotation matrix
-    cos_theta, sin_theta = np.cos(theta), np.sin(theta)
-    R = np.array([[cos_theta, -sin_theta, 0], 
-                  [sin_theta,  cos_theta, 0], 
-                  [0,          0,         1]])
-
 
     return R, t
 

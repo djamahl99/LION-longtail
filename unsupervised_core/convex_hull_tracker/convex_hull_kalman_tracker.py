@@ -96,7 +96,7 @@ class ConvexHullKalmanTracker:
         self.track_query_eps = 3.0  # metres
         self.max_iou_distance = 0.9
 
-        self.min_semantic_threshold = 0.9
+        self.min_semantic_threshold = 0.0
         self.min_iou_threshold = 0.1
         self.min_box_iou = 0.1
 
