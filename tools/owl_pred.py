@@ -1,21 +1,248 @@
+import argparse
 import os
 import pickle
 import subprocess
-import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-import numpy as np
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-
 from torch import nn
-
-from transformers import OwlViTProcessor, OwlViTForObjectDetection, AutoProcessor, Owlv2ForObjectDetection, Owlv2ImageProcessor
 from torchvision.ops import box_iou, nms
+from transformers import (
+    AutoProcessor,
+    Owlv2ForObjectDetection,
+    Owlv2ImageProcessor,
+    OwlViTForObjectDetection,
+    OwlViTProcessor,
+)
 
+ARGOVERSE_PROMPTS = {
+    "REGULAR_VEHICLE": [
+        "a car", "a passenger car", "a sedan", "an SUV", "a pickup truck", 
+        "a van", "a passenger vehicle", "a personal vehicle"
+    ],
+    
+    "PEDESTRIAN": [
+        "a person walking", "a pedestrian", "a person standing", 
+        "a person on foot", "a walking person", "a standing person"
+    ],
+    
+    "BOLLARD": [
+        "a traffic bollard", "a short post", "a road bollard", 
+        "a traffic control post", "a barrier post"
+    ],
+    
+    "CONSTRUCTION_CONE": [
+        "an orange traffic cone", "a construction cone", "an orange cone", 
+        "a traffic safety cone", "a road cone"
+    ],
+    
+    "CONSTRUCTION_BARREL": [
+        "an orange construction barrel", "a traffic barrel", "an orange barrel", 
+        "a construction safety barrel", "a road work barrel"
+    ],
+    
+    "STOP_SIGN": [
+        "a red stop sign", "an octagonal stop sign", "a stop sign", 
+        "a red octagonal sign", "a traffic stop sign"
+    ],
+    
+    "BICYCLE": [
+        "a bicycle", "a bike", "a two-wheeled bicycle", "a pedal bike"
+    ],
+    
+    "LARGE_VEHICLE": [
+        "a large vehicle", "a big truck", "a fire truck", "an RV", 
+        "a recreational vehicle", "a large van", "an emergency vehicle"
+    ],
+    
+    "WHEELED_DEVICE": [
+        "a skateboard", "a scooter", "a segway", "a wheeled device", 
+        "a golf cart", "a personal mobility device"
+    ],
+    
+    "BUS": [
+        "a city bus", "a public bus", "a transit bus", "a passenger bus", 
+        "an urban bus"
+    ],
+    
+    "BOX_TRUCK": [
+        "a box truck", "a delivery truck", "a cube truck", "a moving truck", 
+        "a cargo truck with box"
+    ],
+    
+    "SIGN": [
+        "a traffic sign", "a road sign", "a yield sign", "a speed limit sign", 
+        "a directional sign", "a construction sign"
+    ],
+    
+    "TRUCK": [
+        "a delivery truck", "a UPS truck", "a FedEx truck", "a mail truck", 
+        "a garbage truck", "a utility truck", "an ambulance", "a dump truck"
+    ],
+    
+    "MOTORCYCLE": [
+        "a motorcycle", "a motorbike", "a two-wheeled motorcycle"
+    ],
+    
+    "BICYCLIST": [
+        "a person riding a bicycle", "a cyclist", "a person on a bike", 
+        "a bicycle rider", "a person cycling"
+    ],
+    
+    "VEHICULAR_TRAILER": [
+        "a trailer", "a vehicle trailer", "a towed trailer", "a cargo trailer"
+    ],
+    
+    "TRUCK_CAB": [
+        "a semi truck", "a tractor trailer cab", "a truck cab", 
+        "a semi-trailer truck", "a big rig cab"
+    ],
+    
+    "MOTORCYCLIST": [
+        "a person riding a motorcycle", "a motorcyclist", "a person on a motorcycle", 
+        "a motorcycle rider", "a biker"
+    ],
+    
+    "DOG": [
+        "a dog", "a canine", "a pet dog"
+    ],
+    
+    "SCHOOL_BUS": [
+        "a yellow school bus", "a school bus", "a student bus", 
+        "a children's school bus"
+    ],
+    
+    "WHEELED_RIDER": [
+        "a person on a skateboard", "a person riding a scooter", 
+        "a person on a wheeled device", "a skateboarder", "a scooter rider"
+    ],
+    
+    "STROLLER": [
+        "a baby stroller", "a pushchair", "a pram", "a child stroller"
+    ],
+    
+    "ARTICULATED_BUS": [
+        "an articulated bus", "a bendy bus", "a jointed bus", 
+        "a long articulated bus"
+    ],
+    
+    "MESSAGE_BOARD_TRAILER": [
+        "an electronic message board", "a digital sign trailer", 
+        "a LED message board", "a construction message sign"
+    ],
+    
+    "MOBILE_PEDESTRIAN_SIGN": [
+        "a pedestrian crossing sign", "a mobile crosswalk sign", 
+        "a portable pedestrian sign", "a movable crossing sign"
+    ],
+    
+    "WHEELCHAIR": [
+        "a wheelchair", "a person in a wheelchair", "a mobility wheelchair", 
+        "an electric wheelchair"
+    ],
+    
+    "RAILED_VEHICLE": [
+        "a train", "a trolley", "a subway train", "a rail vehicle", 
+        "a tram", "a train car"
+    ],
+    
+    "OFFICIAL_SIGNALER": [
+        "a traffic controller", "a person directing traffic", 
+        "a traffic officer", "a flagperson", "a construction worker directing traffic"
+    ],
+    
+    "TRAFFIC_LIGHT_TRAILER": [
+        "a portable traffic light", "a temporary traffic signal", 
+        "a mobile traffic light", "a construction traffic light"
+    ],
+    
+    "ANIMAL": [
+        "an animal", "a large animal", "a wild animal", "a farm animal"
+    ]
+}
+
+# Simple implementation for your current code structure
+def get_simple_prompts():
+    """Returns simple prompts similar to your current f'a {x}' format"""
+    return {
+        "REGULAR_VEHICLE": "a car",
+        "PEDESTRIAN": "a person walking", 
+        "BOLLARD": "a traffic bollard",
+        "CONSTRUCTION_CONE": "an orange traffic cone",
+        "CONSTRUCTION_BARREL": "an orange construction barrel", 
+        "STOP_SIGN": "a red stop sign",
+        "BICYCLE": "a bicycle",
+        "LARGE_VEHICLE": "a large vehicle",
+        "WHEELED_DEVICE": "a skateboard",
+        "BUS": "a city bus",
+        "BOX_TRUCK": "a box truck", 
+        "SIGN": "a traffic sign",
+        "TRUCK": "a delivery truck",
+        "MOTORCYCLE": "a motorcycle",
+        "BICYCLIST": "a person riding a bicycle",
+        "VEHICULAR_TRAILER": "a trailer",
+        "TRUCK_CAB": "a semi truck",
+        "MOTORCYCLIST": "a person riding a motorcycle", 
+        "DOG": "a dog",
+        "SCHOOL_BUS": "a yellow school bus",
+        "WHEELED_RIDER": "a person on a skateboard",
+        "STROLLER": "a baby stroller",
+        "ARTICULATED_BUS": "an articulated bus",
+        "MESSAGE_BOARD_TRAILER": "an electronic message board",
+        "MOBILE_PEDESTRIAN_SIGN": "a pedestrian crossing sign",
+        "WHEELCHAIR": "a wheelchair", 
+        "RAILED_VEHICLE": "a train",
+        "OFFICIAL_SIGNALER": "a traffic controller",
+        "TRAFFIC_LIGHT_TRAILER": "a portable traffic light",
+        "ANIMAL": "an animal"
+    }
+
+# Enhanced implementation using multiple prompts per class
+def get_enhanced_text_features(pretrained_name, class_names):
+    """
+    Generate enhanced text features using multiple prompts per class
+    """
+    all_prompts = []
+    class_to_prompt_indices = {}
+
+    model = Owlv2ForObjectDetection.from_pretrained(pretrained_name)
+    processor = AutoProcessor.from_pretrained(pretrained_name)
+    
+    current_idx = 0
+    for class_name in class_names:
+        if class_name in ARGOVERSE_PROMPTS:
+            prompts = ARGOVERSE_PROMPTS[class_name]
+            class_to_prompt_indices[class_name] = list(range(current_idx, current_idx + len(prompts)))
+            all_prompts.extend(prompts)
+            current_idx += len(prompts)
+        else:
+            # Fallback for unknown classes
+            prompt = f"a {class_name.lower().replace('_', ' ')}"
+            class_to_prompt_indices[class_name] = [current_idx]
+            all_prompts.append(prompt)
+            current_idx += 1
+    
+    # Get text features for all prompts
+    inputs = processor(text=[all_prompts], return_tensors="pt")
+    text_features = model.owlv2.get_text_features(**inputs)
+    
+    # Average features for each class (if using multiple prompts)
+    class_features = {}
+    for class_name, indices in class_to_prompt_indices.items():
+        if len(indices) == 1:
+            class_features[class_name] = text_features[indices[0]]
+        else:
+            # Average multiple prompts for the same class
+            class_text_features = text_features[indices]
+            class_features[class_name] = class_text_features.mean(dim=0)
+    
+    return class_features, text_features
 
 class OWLv2Detector(nn.Module):
     def __init__(self, pretrained_name, class_names):
@@ -646,12 +873,24 @@ def main():
                        help='Create visualizations for first log and timestamp')
     
     args = parser.parse_args()
+
+
+    class_features, text_features = get_enhanced_text_features('google/owlv2-large-patch14-ensemble', ARGOVERSE_PROMPTS.keys())
     
+    # print("class_features", class_features.shape)
+    print("text_features", text_features.shape)
+
+    torch.save(class_features, './class_features.pt')
+    torch.save(text_features, './text_features.pt')
+
+    exit()
+
+
     # Initialize your OWLv2 model here
     pretrained_name = 'google/owlv2-large-patch14-ensemble'
     owlvit_model = OWLv2Detector(pretrained_name, ['placeholder']).to('cuda:1')
     owlvit_model.eval()
-    
+
     data_root = Path(args.data_root)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

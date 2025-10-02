@@ -25,42 +25,39 @@ def convert_bbs_type(boxes, input_box_type):
         return new_boxes
 
 def get_registration_angle(mat):
-    cos_theta = mat[0, 0]
-    sin_theta = mat[1, 0]
+    return np.arctan2(mat[1, 0], mat[0, 0])
 
-    if cos_theta < -1:
-        cos_theta = -1
-    if cos_theta > 1:
-        cos_theta = 1
+def wrap_angle(yaw):
+    return np.arctan2(np.sin(yaw), np.cos(yaw))
 
-    theta_cos = np.arccos(cos_theta)
-
-    if sin_theta >= 0:
-        return theta_cos
-    else:
-        return 2 * np.pi - theta_cos
-
+def points_rigid_transform(cloud, pose):
+    cloud = np.array(cloud)
+    if cloud.shape[0] == 0:
+        return cloud
+    mat = np.ones(shape=(cloud.shape[0], 4), dtype=np.float32)
+    pose_mat = np.mat(pose)
+    mat[:, 0:3] = cloud[:, 0:3]
+    mat = np.mat(mat)
+    transformed_mat = pose_mat * mat.T
+    T = np.array(transformed_mat.T, dtype=np.float32)
+    return T[:, 0:3]
 
 def register_bbs(boxes, pose):
-
     if pose is None:
         return boxes
 
     ang = get_registration_angle(pose)
 
-    t_id = boxes.shape[1] // 7
+    new_boxes = boxes.copy()
 
-    ones = np.ones(shape=(boxes.shape[0], 1))
-    for i in range(t_id):
-        b_id = i * 7
-        box_xyz = boxes[:, b_id:b_id + 3]
-        box_xyz1 = np.concatenate([box_xyz, ones], -1)
+    world_positions = points_rigid_transform(boxes[:, :3], pose)
+    
+    new_boxes[:, :3] = world_positions
 
-        box_world = np.matmul(box_xyz1, pose.T)
+    for i in range(len(boxes)):
+        new_boxes[i, 6] = wrap_angle(new_boxes[i, 6] + ang)
 
-        boxes[:, b_id:b_id + 3] = box_world[:, 0:3]
-        boxes[:, b_id + 6] += ang
-    return boxes
+    return new_boxes
 
 def corners3d_to_img_boxes(P2, corners3d):
     """

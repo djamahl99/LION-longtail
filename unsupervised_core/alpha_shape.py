@@ -5,7 +5,7 @@ import os
 import pickle as pkl
 import pstats
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from pprint import pprint
@@ -39,7 +39,7 @@ from kornia.geometry.linalg import transform_points
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.distance import cdist
-from shapely.geometry import MultiPoint, Polygon, box
+from shapely.geometry import MultiPoint, Polygon
 from shapely.ops import unary_union
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm, trange
@@ -67,6 +67,9 @@ from lion.unsupervised_core.convex_hull_tracker.convex_hull_utils import (
     voxel_sampling_fast,
 )
 from lion.unsupervised_core.convex_hull_tracker.global_tracker import GlobalTracker
+from lion.unsupervised_core.convex_hull_tracker.pose_kalman_filter import (
+    PoseKalmanFilter,
+)
 from lion.unsupervised_core.rotate_iou_cpu_eval import rotate_iou_cpu_eval
 from lion.unsupervised_core.tracker.box_op import register_bbs
 
@@ -84,7 +87,7 @@ from .trajectory_optimizer import (
     simple_pairwise_icp_refinement,
 )
 
-PROFILING = True
+PROFILING = False
 
 def iou_multipoint(hull1, hull2) -> float:
     """
@@ -662,10 +665,91 @@ class OWLViTAlphaShapeMFCF:
         all_points = points_rigid_transform(all_points, pose_i)
         all_H = np.concatenate(all_H)
         all_points = all_points[all_H > thresh]
-        new_box_points = np.concatenate([all_points, cur_points])
+        new_box_points = np.concatenate([all_points, cur_points], axis=0)
         new_box_points = voxel_sampling_fast(new_box_points)
 
         return new_box_points, cur_points
+
+    def _load_temporal_lidar_seflow_window(
+        self, frame_idx: int, infos: List[Dict], flow_per_timestamp: Dict[int, np.ndarray], gm_per_timestamp: Dict[int, np.ndarray]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Load and aggregate LiDAR points from temporal window (same as AlphaShapeMFCF)."""
+        pose_i = np.linalg.inv(infos[frame_idx]["pose"])
+        all_points = []
+        all_flow = []
+        all_H = []
+        cur_points = np.zeros((0,3))
+        cur_flow = np.zeros((0,3))
+
+        win_size = self.dataset_cfg.GeneratorConfig.frame_num
+        inte = self.dataset_cfg.GeneratorConfig.frame_interval
+        thresh = self.dataset_cfg.GeneratorConfig.ppscore_thresh
+
+        res_x = 0.1
+        res_y = 0.1
+        res_z = 0.1
+
+
+        for j in range(
+            max(frame_idx - win_size, 0), min(frame_idx + win_size, len(infos)), inte
+        ):
+            info_path = str(j).zfill(4) + ".npy"
+            lidar_path = os.path.join(self.root_path, self.log_id, info_path)
+            if not os.path.exists(lidar_path):
+                continue
+
+            pose_j = infos[j]["pose"]
+            time_j = infos[j]["timestamp_ns"]
+            lidar_points = np.load(lidar_path)[:, 0:3]
+            flow = flow_per_timestamp[time_j]
+            gm = gm_per_timestamp[time_j]
+
+            # remove ground
+            is_not_ground = ~gm
+            lidar_points = lidar_points[is_not_ground]
+            flow = flow.copy()[is_not_ground]
+
+            if j == frame_idx:
+                cur_points = lidar_points
+                cur_flow = flow
+
+            lidar_points = points_rigid_transform(lidar_points, pose_j)
+            H_path = os.path.join(self.root_path, self.log_id, "ppscore", info_path)
+            if os.path.exists(H_path):
+                H = np.load(H_path)
+                H = H[is_not_ground]
+                all_H.append(H)
+            else:
+                all_H.append(np.ones(len(lidar_points)))  # Default to all points
+            all_points.append(lidar_points)
+            all_flow.append(flow)
+
+        all_points = np.concatenate(all_points)
+        all_flow = np.concatenate(all_flow)
+        all_points = points_rigid_transform(all_points, pose_i)
+        all_H = np.concatenate(all_H)
+        all_points = all_points[all_H > thresh]
+        all_flow = all_flow[all_H > thresh]
+        new_box_points = np.concatenate([all_points, cur_points], axis=0)
+        new_flows = np.concatenate([all_flow, cur_flow], axis=0)
+
+        # Vectorized voxel coordinate computation
+        mins = new_box_points.min(axis=0)
+        voxel_coords = ((new_box_points - mins) / [res_x, res_y, res_z]).astype(np.int32)
+        
+        # Create unique voxel indices using numpy
+        _, unique_indices, inverse_indices = np.unique(
+            voxel_coords, axis=0, return_index=True, return_inverse=True
+        )
+
+        assert len(new_box_points) == len(new_flows)
+
+        new_box_points = new_box_points[unique_indices]
+        new_flows = new_flows[unique_indices]
+
+        assert len(new_box_points) == len(new_flows)
+
+        return new_box_points, new_flows
 
     def _get_traditional_clusters(self, points: np.ndarray) -> List[np.ndarray]:
         """Get traditional LiDAR clusters (same as AlphaShapeMFCF)."""
@@ -1137,6 +1221,8 @@ class OWLViTAlphaShapeMFCF:
         cmp_lbl = 0
         for eps in [1.0]:
             components_labels, n_components = fast_connected_components(point_features, eps=eps, min_samples=self.min_component_points)
+
+            # components_labels, n_components = fast_connected_components_lidar_flow(points, flow, eps_lidar=eps, min_samples=self.min_component_points)
 
             for cmp_lbl_ in range(n_components):
                 mask = (components_labels == cmp_lbl_)
@@ -2096,9 +2182,82 @@ class OWLViTAlphaShapeMFCF:
                 points_per_timestamp[int(t0)] = pc0
                 gm_per_timestamp[int(t0)] = f[t0]['ground_mask'][:]
 
+        n_frames = min(10, len(infos))
+
+        for i in range(n_frames):
+            # plot seflow points vs the original to see any discrepancies?
+            fig, ax = plt.subplots(figsize=(8,8))
+
+            pose = infos[i]['pose']
+            timestamp_ns = infos[i]["timestamp_ns"]           
+
+            info_path = str(i).zfill(4) + ".npy"
+            lidar_path = os.path.join(self.root_path, self.log_id, info_path)
+            if not os.path.exists(lidar_path):
+                continue
+
+            lidar_cpd = np.load(lidar_path)[:, 0:3] 
+            lidar_seflow = points_per_timestamp[timestamp_ns]
+            lidar_joined, lidar_joined_flow = self._load_temporal_lidar_seflow_window(i, infos, flow_per_timestamp, gm_per_timestamp)
+
+            print("lidar_cpd", lidar_cpd.shape)
+            print("lidar_seflow", lidar_seflow.shape)
+
+            seflow_tree = cKDTree(lidar_seflow)
+
+            distances, _ = seflow_tree.query(lidar_cpd)
+
+            print("mean seflow <-> cpd distance", np.mean(distances))
+
+            ax.scatter(
+                lidar_cpd[:, 0],
+                lidar_cpd[:, 1],
+                s=1,
+                c="blue",
+                label="CPD",
+                alpha=0.5,
+            )
+
+            ax.scatter(
+                lidar_seflow[:, 0],
+                lidar_seflow[:, 1],
+                s=1,
+                c="green",
+                label="seflow",
+                alpha=0.5,
+            )
+
+            ax.scatter(
+                lidar_joined[:, 0],
+                lidar_joined[:, 1],
+                s=1,
+                c="red",
+                label="_load_temporal_lidar_seflow_window",
+                alpha=0.5,
+            )
+
+
+            ax.set_aspect("equal")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel("X (meters)", fontsize=12)
+            ax.set_ylabel("Y (meters)", fontsize=12)
+
+            # Now zoom in
+            xc, yc = 0, 0
+            plt.xlim(xc + -50, xc + 50)
+            plt.ylim(yc + -50, yc + 50)
+
+            plt.tight_layout()
+
+            save_folder = Path("./lidar_sefow_cpd_comparison")
+            save_folder.mkdir(exist_ok=True)
+            save_path = save_folder / f"frame_{i}.png"
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            plt.close()
+
         print(f"{len(flow_per_timestamp)=}")
 
-        n_frames = min(10, len(infos))
 
         all_labels = []
         all_pose = []
@@ -2120,7 +2279,14 @@ class OWLViTAlphaShapeMFCF:
             # ego transformation (ego -> city)
             city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[timestamp_ns]
 
-            pcl_ego = points_per_timestamp[timestamp_ns]
+            # seflow points -> somehow they are offset?
+            # pcl_ego = points_per_timestamp[timestamp_ns]
+
+            info_path = str(i).zfill(4) + ".npy"
+            lidar_path = os.path.join(self.root_path, self.log_id, info_path)
+            pcl_ego = np.load(lidar_path)[:, 0:3]
+
+
             is_ground = gm_per_timestamp[timestamp_ns]
             flow_ego = flow_per_timestamp[timestamp_ns]
 
@@ -2129,7 +2295,23 @@ class OWLViTAlphaShapeMFCF:
             pcl_ego = pcl_ego[is_not_ground]
             flow_ego = flow_ego[is_not_ground]
 
+            print("pcl_ego v1 flow_ego.shape", pcl_ego.shape, flow_ego.shape)
+            flow_norms = np.linalg.norm(flow_ego, axis=1)
+            x1, x2, x3 = flow_norms.min(), flow_norms.mean(), flow_norms.max()
+            print(f"flow_ego {x1=:.2f} {x2=:.2f} {x3=:.2f}")
+
+            pcl_ego, flow_ego = self._load_temporal_lidar_seflow_window(i, infos, flow_per_timestamp, gm_per_timestamp)
+
+            print("pcl_ego _load_temporal_lidar_seflow_window", pcl_ego.shape, flow_ego.shape)
+            flow_norms = np.linalg.norm(flow_ego, axis=1)
+            x1, x2, x3 = flow_norms.min(), flow_norms.mean(), flow_norms.max()
+            print(f"flow_ego {x1=:.2f} {x2=:.2f} {x3=:.2f}")
+
             pcl_ego_pred = pcl_ego + flow_ego
+
+            print("pcl_ego", pcl_ego.dtype)
+            print("flow_ego", flow_ego.dtype)
+            print("pcl_ego_pred", pcl_ego_pred.dtype)
 
             pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
             pcl_ego_pred_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego_pred)
@@ -2162,14 +2344,55 @@ class OWLViTAlphaShapeMFCF:
         global_tracker.calculate()
         # exit()
 
+        global_all_boxes = []
+        global_all_poses = []
+        global_all_times = []
+        global_all_vertices = []
+        global_all_vertices_indices = [] # should match the box indices...
+
+        box_idx = 0
+        for track in global_tracker.tracks:
+            assert len(track.timestamps) == len(track.optimized_boxes) == len(track.optimized_poses)
+
+            for timestamp_ns, box, pose in zip(track.timestamps, track.optimized_boxes, track.optimized_poses):
+                global_all_boxes.append(box)
+                global_all_poses.append(pose)
+                global_all_times.append(timestamp_ns)
+
+                mesh: Optional[trimesh.Trimesh] = track.to_mesh(timestamp_ns)
+
+                if mesh is not None:
+                    vertices = mesh.vertices
+
+                    vertices_2d = vertices[:, :2]
+                    hull = ConvexHull(vertices_2d)
+                    vertices_2d = vertices_2d[hull.vertices]
+
+                    global_all_vertices.append(vertices_2d)
+                    global_all_vertices_indices.append(np.full((vertices_2d.shape[0]), fill_value=box_idx))
+
+                box_idx += 1
+
+        global_all_boxes = np.stack(global_all_boxes, axis=0)
+        global_all_poses = np.stack(global_all_poses, axis=0)
+        global_all_times = np.array(global_all_times, int)
+        global_all_vertices = np.concatenate(global_all_vertices, axis=0)
+        global_all_vertices_indices = np.concatenate(global_all_vertices_indices, axis=0)
+
+        np.save("global_all_boxes.npy", global_all_boxes)
+        np.save("global_all_poses.npy", global_all_poses)
+        np.save("global_all_times.npy", global_all_times)
+        np.save("global_all_vertices.npy", global_all_vertices)
+        np.save("global_all_vertices_indices.npy", global_all_vertices_indices)
+            
+
         smooth_tracker = TrackSmooth(self.dataset_cfg.GeneratorConfig)
         smooth_tracker.tracking(all_labels, all_pose)
 
+        all_vision_cluster_boxes = {}
 
-        for i in trange(n_frames, desc=f"Generating hybrid alpha shapes"):
-            # 1. Load temporal LiDAR window
-            aggregated_points = None
-            # aggregated_points, cur_points = self._load_temporal_lidar_window(i, infos)
+
+        for i in trange(1, desc=f"Generating hybrid alpha shapes"):
 
             pose = infos[i]['pose']
 
@@ -2223,36 +2446,7 @@ class OWLViTAlphaShapeMFCF:
             # Find the lidar timestamps
             lidar_folder = sensor_dir / "lidar"
 
-            # if aggregated_points is None:
-            #     lidar_feather_path = lidar_folder / f"{timestamp_ns}.feather"
-            #     lidar = read_feather(lidar_feather_path)
-            #     pcl_ego = lidar.loc[:, ["x", "y", "z"]].to_numpy().astype(float)
-            #     pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
-            # else:
-            #     pcl_ego = aggregated_points
-            #     pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
-
-            # # TODO cache
-            # is_ground = raster_ground_height_layer.get_ground_points_boolean(
-            #     pcl_city_1
-            # ).astype(bool)
-            # is_not_ground = ~is_ground
-
-            # pcl_city_1 = pcl_city_1[is_not_ground]
-            # pcl_ego = pcl_ego[is_not_ground]
-
-            pcl_ego = points_per_timestamp[timestamp_ns]
-            is_ground = gm_per_timestamp[timestamp_ns]
-            flow_ego = flow_per_timestamp[timestamp_ns]
-
-            is_not_ground = ~is_ground
-
-            print("is_not_ground", is_not_ground.sum(), is_not_ground.shape)
-            print("pcl_ego", pcl_ego.shape)
-            print("flow", flow.shape)
-
-            pcl_ego = pcl_ego[is_not_ground]
-            flow_ego = flow_ego[is_not_ground]
+            pcl_ego, flow_ego = self._load_temporal_lidar_seflow_window(i, infos, flow_per_timestamp, gm_per_timestamp)
 
             pcl_ego_pred = pcl_ego + flow_ego
 
@@ -2281,6 +2475,8 @@ class OWLViTAlphaShapeMFCF:
                 lidar_tree
             )
 
+            # all_vision_cluster_boxes[i] = [x.box for x in vision_guided_clusters]
+
             if i == 0 and PROFILING:
                 pr.disable()
 
@@ -2299,7 +2495,7 @@ class OWLViTAlphaShapeMFCF:
             if i > 0 and PROFILING:
                 pr = cProfile.Profile()
                 pr.enable()
-            tracker.update(vision_guided_clusters, infos[i]['pose'], lidar_tree, flow)
+            # tracker.update(vision_guided_clusters, infos[i]['pose'], lidar_tree, flow)
             if i > 0 and PROFILING:
                 pr.disable()
 
@@ -2754,6 +2950,10 @@ class OWLViTAlphaShapeMFCF:
                 print("all_boxes", all_boxes)
                 raise e
 
+            box_types_counter = Counter(all_box_types)
+            print("box types counts", list(box_types_counter.items()))
+
+
             if len(gt_lidar_boxes) > 0 and len(all_boxes) > 0:
                 ious = rotate_iou_cpu_eval(gt_lidar_boxes, all_boxes).reshape(
                     gt_lidar_boxes.shape[0], all_boxes.shape[0], 2
@@ -2807,7 +3007,6 @@ class OWLViTAlphaShapeMFCF:
                     else:
                         print(f"Box type {box_type} had no matches")
 
-                from collections import Counter
                 counter = Counter(votes)
                 print("best gt matches", counter.most_common(4))
                 
@@ -3050,13 +3249,14 @@ class OWLViTAlphaShapeMFCF:
 
 
         non_none = set()
+        new_track_id = 0
         for track in tqdm(tracker.tracks, desc='Adding tracks to output'):
             if track.optimized_boxes is None or track.optimized_poses is None or track.timestamps is None:
                 print(f"optimized_boxes is none for track_id: {track.track_id}")
                 print(f"{track.optimized_boxes=} {track.optimized_poses=} {track.timestamps=}")
                 continue
-
-            non_none.add(track.track_id)
+            
+            non_none.add(new_track_id)
 
             for timestamp_ns, box, pose in zip(track.timestamps, track.optimized_boxes, track.optimized_poses):
                 frame_id = timestamp_to_idx[timestamp_ns]
@@ -3080,11 +3280,101 @@ class OWLViTAlphaShapeMFCF:
                 print("ego box", box)
 
                 infos[frame_id]["outline_box"].append(box)
-                infos[frame_id]["outline_ids"].append(track.track_id)
-                infos[frame_id]["outline_cls"].append(track.source)
+                infos[frame_id]["outline_ids"].append(new_track_id)
+                infos[frame_id]["outline_cls"].append(f"ctk_{track.source}")
                 infos[frame_id]["outline_dif"].append(1)
                 infos[frame_id]["alpha_shapes"].append({'vertices_3d': mesh.vertices})
                 infos[frame_id]["outline_poses"].append(pose)
+
+            new_track_id += 1
+
+        
+
+        for track in tqdm(global_tracker.tracks, desc='Adding global tracks to output'):
+            if track.optimized_boxes is None or track.optimized_poses is None or track.timestamps is None:
+                print(f"optimized_boxes is none for global track_id: {track.track_id}")
+                print(f"{track.optimized_boxes=} {track.optimized_poses=} {track.timestamps=}")
+                continue
+
+            non_none.add(new_track_id)
+            for timestamp_ns, box, pose in zip(track.timestamps, track.optimized_boxes, track.optimized_poses):
+                frame_id = timestamp_to_idx[timestamp_ns]
+
+                ego_pose = infos[frame_id]['pose']
+                world_to_ego = np.linalg.inv(ego_pose)
+
+                # world_points = points_rigid_transform(track.object_points, pose)
+                world_mesh = track.to_mesh(timestamp_ns)
+                if world_mesh is not None:
+                    mesh = world_mesh.copy().apply_transform(world_to_ego)
+                    mesh_vertices = mesh.vertices
+                else:
+                    assert False
+
+                box = register_bbs(box.copy().reshape(1, 7), world_to_ego)[0]
+
+                infos[frame_id]["outline_box"].append(box)
+                infos[frame_id]["outline_ids"].append(new_track_id)
+                infos[frame_id]["outline_cls"].append(f"gtk_{track.source}")
+                infos[frame_id]["outline_dif"].append(1)
+                infos[frame_id]["alpha_shapes"].append({'vertices_3d': mesh_vertices})
+                infos[frame_id]["outline_poses"].append(pose)
+
+            new_track_id += 1
+
+            # add the predicted ones
+            predicted_boxes = track.box_predictor.predict_boxes(track.timestamps)
+            for timestamp_ns, box in zip(track.timestamps, predicted_boxes):
+                frame_id = timestamp_to_idx[timestamp_ns]
+
+                ego_pose = infos[frame_id]['pose']
+                world_to_ego = np.linalg.inv(ego_pose)
+
+                # world_points = points_rigid_transform(track.object_points, pose)
+                world_mesh = track.to_mesh(timestamp_ns)
+                if world_mesh is not None:
+                    mesh = world_mesh.copy().apply_transform(world_to_ego)
+                    mesh_vertices = mesh.vertices
+                else:
+                    assert False
+
+                box = register_bbs(box.copy().reshape(1, 7), world_to_ego)[0]                
+
+                pose = PoseKalmanFilter.box_to_transform(box)
+
+                infos[frame_id]["outline_box"].append(box)
+                infos[frame_id]["outline_ids"].append(new_track_id)
+                infos[frame_id]["outline_cls"].append(f"gtk_predicted_{track.source}")
+                infos[frame_id]["outline_dif"].append(1)
+                infos[frame_id]["alpha_shapes"].append({'vertices_3d': mesh_vertices})
+                infos[frame_id]["outline_poses"].append(pose)
+
+            new_track_id += 1
+
+        # for i in range(len(infos)):
+        #     ego_pose = infos[i]['pose']
+        #     world_to_ego = np.linalg.inv(ego_pose)
+
+        #     if i not in all_vision_cluster_boxes:
+        #         continue
+
+        #     for box in all_vision_cluster_boxes[i]:
+
+        #         box = register_bbs(box.copy().reshape(1, 7), world_to_ego)[0]                   
+
+        #         mesh_vertices = get_rotated_3d_box_corners(box)
+
+        #         pose = PoseKalmanFilter.box_to_transform(box)
+
+        #         infos[frame_id]["outline_box"].append(box)
+        #         infos[frame_id]["outline_ids"].append(new_track_id)
+        #         infos[frame_id]["outline_cls"].append("vision_cluster")
+        #         infos[frame_id]["outline_dif"].append(1)
+        #         infos[frame_id]["alpha_shapes"].append({'vertices_3d': mesh_vertices})
+        #         infos[frame_id]["outline_poses"].append(pose)
+
+        #         new_track_id += 1            
+
 
         print(f"{non_none=}")
 

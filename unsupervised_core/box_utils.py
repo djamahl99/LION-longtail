@@ -251,6 +251,35 @@ def fast_connected_components(points, eps=0.5, min_samples=1):
     
     return labels, n_components
 
+def fast_connected_components_lidar_flow(points, flow, eps_lidar=0.5, eps_flow=0.5, min_samples=1):
+    clustering_lidar = DBSCAN(eps=eps_lidar, min_samples=min_samples, n_jobs=1, algorithm='kd_tree').fit(points)
+    lidar_labels = clustering_lidar.labels_
+    # n_components = len(set(labels)) - (1 if -1 in labels else 0)
+    lidar_n_components = lidar_labels.max() + 1    
+
+    labels = np.zeros_like(lidar_labels)
+    labels[:] = -1
+    n_components = 0
+
+    for cmp_label in range(lidar_n_components):
+        indices = np.where(lidar_labels == cmp_label)[0]
+
+        if len(indices) < min_samples:
+            continue
+
+        clust_flow = flow[indices]
+        clustering_flow = DBSCAN(eps=eps_flow, min_samples=min_samples, n_jobs=1, algorithm='kd_tree').fit(clust_flow)
+        flow_labels = clustering_flow.labels_
+
+        for flow_label in range(flow_labels.max() + 1):
+            sub_indices = np.where(flow_labels == flow_label)[0]
+
+            sub_indices = indices[sub_indices]
+
+            labels[sub_indices] = n_components
+            n_components += 1
+
+    return labels, n_components
 
 def box_iou(boxes1, boxes2):
     """

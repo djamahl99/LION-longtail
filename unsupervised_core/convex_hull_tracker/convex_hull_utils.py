@@ -76,7 +76,7 @@ def compute_confidence_from_icp(points_i, points_j, R, t, cost):
     
     return overlap_ratio * cost_confidence
 
-def voxel_sampling_fast(points, res_x=0.1, res_y=0.1, res_z=0.1):
+def voxel_sampling_fast(points, res_x=0.05, res_y=0.05, res_z=0.05):
     """Ultra-fast vectorized voxel sampling"""
     if len(points) == 0:
         return points
@@ -423,6 +423,10 @@ def relative_object_pose(
 def analytical_z_rotation_centered(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Z-axis rotation for already-centered points (yaw only)."""
     
+    # t = np.zeros((3,), float)
+    # t_2d = np.mean(B - A, axis=0)[:2]
+    # t[:2] = t_2d
+
     t = np.mean(B - A, axis=0)
 
     A_translated = A + t

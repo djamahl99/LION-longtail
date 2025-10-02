@@ -107,7 +107,7 @@ def signal_handler(signum, frame):
     if threading.current_thread() is threading.main_thread() and current_process.name == 'MainProcess':
         print(f"\n=== PROCESS KILLED (Signal {signum}) ===")
         print("Stack trace at time of termination:")
-        traceback.print_stack(frame, file="cpd_analyzer_stack.log")
+        # traceback.print_stack(frame, file="cpd_analyzer_stack.log")
         print("=" * 60)
     
     # Try to gracefully shutdown multiprocessing resources
@@ -823,7 +823,7 @@ def load_and_plot_objects(
         outline_scores = frame_info.get("outline_score", [])
         pose = frame_info.get("pose", np.eye(4))
 
-        frame_object_counts.append(len([x for x in outline_scores if x > 0]))
+        frame_object_counts.append(len(outline_boxes))
 
         for box_idx, (box, obj_id, cls, score) in enumerate(
             zip(outline_boxes, outline_ids, outline_cls, outline_scores)
@@ -1236,10 +1236,364 @@ def load_and_plot_objects(
     return outline_infos
 
 
+def load_and_plot_global_boxes(
+    use_first_frame=True,
+    plot_trajectories=False,
+    figsize=(12, 10),
+    save_path="global_boxes.png",
+    gts_dataframe=None,
+    ref_timestamp_ns=None,
+    log_id: str = "",
+    score_thresh=-1,
+):
+    """
+    Load object detection data and plot BEV with bounding boxes and trajectories.
+    Can also overlay ground truth data from a dataframe.
+
+    Args:
+        output_info_path (str): Path to the pickle file containing object info
+        use_first_frame (bool): If True, use first frame as reference. If False, use frame with most objects
+        plot_trajectories (bool): Whether to plot object trajectories
+        figsize (tuple): Figure size for the plot
+        save_path (str): Optional path to save the plot
+        gts_dataframe (pd.DataFrame, optional): Ground truth dataframe in Argoverse 2 format
+        ref_timestamp_ns (int, optional): Specific timestamp to use for GT filtering
+
+    Returns:
+        dict: Loaded object information
+    """
+
+    global_all_boxes = np.load("global_all_boxes.npy")
+    global_all_poses = np.load("global_all_poses.npy")
+    global_all_times = np.load("global_all_times.npy")
+
+    timestamps, counts = np.unique(global_all_times, return_counts=True)
+
+    ref_frame_idx = np.argmax(counts)
+    timestamp_ns = timestamps[ref_frame_idx]
+
+    indices = np.where(timestamps == timestamp_ns)[0]
+
+    outline_boxes = global_all_boxes[indices]
+    outline_ids = indices
+    outline_cls = np.ones((len(indices),), int)
+    outline_scores = np.ones((len(indices),), float)
+
+
+    print(
+        f"Using frame {ref_frame_idx} as reference (contains {counts[ref_frame_idx]} objects)"
+    )
+
+    # Create the plot
+    fig, ax = plt.subplots(figsize=figsize)
+
+    log_dir = Path("/home/uqdetche/lidar_longtail_mining/lion/data/argo2/sensor") / "val" / log_id
+    sensor_dir = log_dir / "sensors"
+
+    timestamp_city_SE3_ego_dict = read_city_SE3_ego(log_dir=log_dir)
+
+    lidar_folder = sensor_dir / "lidar"
+
+    lidar_feather_path = lidar_folder / f"{timestamp_ns}.feather"
+    lidar = read_feather(lidar_feather_path)
+    pcl_ego = lidar.loc[:, ["x", "y", "z"]].to_numpy().astype(float)
+
+    city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[timestamp_ns]
+
+    pcl_city_1 = city_SE3_ego_lidar_t.transform_point_cloud(pcl_ego)
+
+
+    log_dir = Path(
+        f"/home/uqdetche/lidar_longtail_mining/lion/data/argo2/sensor/val/{log_id}/"
+    )
+    avm = ArgoverseStaticMap.from_map_dir(log_dir / "map", build_raster=True)
+
+    # scaled to [0,1] for matplotlib.
+    PURPLE_RGB = [201, 71, 245]
+    PURPLE_RGB_MPL = np.array(PURPLE_RGB) / 255
+
+    crosswalk_color = PURPLE_RGB_MPL
+    CROSSWALK_ALPHA = 0.6
+    for pc in avm.get_scenario_ped_crossings():
+        vector_plotting_utils.plot_polygon_patch_mpl(
+            polygon_pts=pc.polygon[:, :2],
+            ax=ax,
+            color=crosswalk_color,
+            alpha=CROSSWALK_ALPHA,
+            zorder=3,
+        )
+
+    plot_lane_segments(ax=ax, lane_segments=avm.get_scenario_lane_segments())
+
+    ax.scatter(
+        pcl_city_1[:, 0],
+        pcl_city_1[:, 1],
+        s=1,
+        c="blue",
+        label="Lidar Points",
+        alpha=0.5,
+    )
+
+    # Color map for different classes
+    class_colors = plt.cm.Set3(np.linspace(0, 1, 12))
+    class_to_color = {}
+
+    print("outline_boxes", len(outline_boxes))
+    print("outline_ids", len(outline_ids))
+    print("outline_cls", len(outline_cls))
+    print("outline_scores", len(outline_scores))
+    # print("outline_scores", outline_scores)
+
+    print("outline_boxes", outline_boxes)
+
+    outline_boxes_filtered = [
+        x for x, y in zip(outline_boxes, outline_scores) if y > score_thresh
+    ]
+
+    # Plot ground truth boxes if provided
+    if gts_dataframe is not None:
+        print("Plotting ground truth boxes...")
+
+        gt_frame = gts_dataframe.loc[[(log_id, int(timestamp_ns))]]
+
+        gt_lidar_boxes = argo2_box_to_lidar(
+            gt_frame[
+                [
+                    "tx_m",
+                    "ty_m",
+                    "tz_m",
+                    "length_m",
+                    "width_m",
+                    "height_m",
+                    "qw",
+                    "qx",
+                    "qy",
+                    "qz",
+                ]
+            ].values
+        ).to(dtype=torch.float32)
+
+        pred_lidar_boxes = torch.tensor(outline_boxes_filtered, dtype=torch.float32)
+
+        print("gt_lidar_boxes", gt_lidar_boxes.shape)
+        print("pred_lidar_boxes", pred_lidar_boxes.shape)
+
+        if len(gt_lidar_boxes) > 0:
+            ious = rotate_iou_cpu_eval(gt_lidar_boxes, pred_lidar_boxes).reshape(
+                gt_lidar_boxes.shape[0], pred_lidar_boxes.shape[0], 2
+            )
+            ious = ious[:, :, 0]
+        else:
+            ious = np.zeros((0, len(pred_lidar_boxes)), dtype=np.float32)
+
+        # dists = cdist(gt_lidar_boxes[:, :3].to(dtype=torch.float32), pred_lidar_boxes[:, :3]).numpy()
+        print("ious", ious.shape)
+
+        pred_ious = ious.max(axis=0)
+
+        print(
+            f"TPS/FPS {pred_ious.shape}",
+            (pred_ious > 0.3).sum(),
+            (pred_ious <= 0.3).sum(),
+        )
+
+        print("ious", ious.shape)
+        if np.prod(ious.shape) > 0: 
+            best_ious = ious.max(axis=1)
+            best_ious_idx = ious.argmax(axis=1)
+        else:
+            best_ious = None
+
+        # best_dists = dists[np.arange(len(dists)), best_ious_idx]
+
+        print("best_ious", best_ious)
+
+        print(
+            f"Found {len(gt_frame)} ground truth objects"
+        )
+
+        # Plot GT boxes
+        for idx, (_, gt_row) in enumerate(gt_frame.iterrows()):
+            try:
+                
+                iou = best_ious[idx] if best_ious is not None else 0.0
+                # Extract box parameters from Argoverse format
+                center_xy = [gt_row["tx_m"], gt_row["ty_m"]]
+                length = gt_row["length_m"]
+                width = gt_row["width_m"]
+
+                # Convert quaternion to yaw
+                qw, qx, qy, qz = (
+                    gt_row["qw"],
+                    gt_row["qx"],
+                    gt_row["qy"],
+                    gt_row["qz"],
+                )
+                yaw = quat_to_yaw(qw, qx, qy, qz)
+
+                # Get category for coloring
+                category = gt_row.get("category", "UNKNOWN")
+
+                # Get rotated box corners
+                corners = get_rotated_box(center_xy, length, width, yaw)
+
+                # Create polygon patch for GT (different style)
+                gt_polygon = patches.Polygon(
+                    corners,
+                    linewidth=3,
+                    edgecolor="red",
+                    facecolor="none",
+                    alpha=0.8,
+                    linestyle="-",
+                    label="Ground Truth" if _ == 0 else "",
+                )
+                ax.add_patch(gt_polygon)
+
+                # Add GT label
+                # ax.text(center_xy[0], center_xy[1] + length/2 + 1, f'GT: {category}',
+                #        ha='center', va='bottom', fontsize=7, fontweight='bold',
+                #        bbox=dict(boxstyle='round,pad=0.2', facecolor='red', alpha=0.7, edgecolor='white'),
+                #        color='white')
+
+                ax.text(
+                    center_xy[0],
+                    center_xy[1] + length / 2 + 1,
+                    f"{iou:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    fontweight="bold",
+                    bbox=dict(
+                        boxstyle="round,pad=0.2",
+                        facecolor="red",
+                        alpha=0.7,
+                        edgecolor="white",
+                    ),
+                    color="white",
+                )
+
+            except Exception as e:
+                print(f"Error plotting GT box: {e}")
+                continue
+
+
+    for box, obj_id, cls, score in zip(
+        outline_boxes, outline_ids, outline_cls, outline_scores
+    ):
+        if len(box) >= 7 and score > score_thresh:
+            center_xy = box[:2]
+            length = box[3]
+            width = box[4]
+            yaw = box[6]
+
+            # Get color for this class
+            if cls not in class_to_color:
+                class_to_color[cls] = class_colors[
+                    len(class_to_color) % len(class_colors)
+                ]
+
+            # Get rotated box corners
+            corners = get_rotated_box(center_xy, length, width, yaw)
+
+            # Create polygon patch for predictions
+            polygon = patches.Polygon(
+                corners,
+                linewidth=1.5,
+                edgecolor="black",
+                facecolor=class_to_color[cls],
+                alpha=1.0,
+                label=(
+                    f"Pred: {cls}"
+                    if cls
+                    not in [p.get_label().replace("Pred: ", "") for p in ax.patches]
+                    else ""
+                ),
+            )
+            ax.add_patch(polygon)
+
+            # Commented out text labels as per user's modification
+            # ax.text(center_xy[0], center_xy[1], f'{cls}\nID:{obj_id}\n{score:.2f}',
+            #        ha='center', va='center', fontsize=8, fontweight='bold',
+            #        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+
+    # Set equal aspect ratio and labels
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("X (meters)", fontsize=12)
+    ax.set_ylabel("Y (meters)", fontsize=12)
+
+    # Count valid objects (score > 0)
+    valid_objects = len([s for s in outline_scores if s > score_thresh])
+    title = f"Bird's Eye View - Log {log_id} Frame {ref_frame_idx}\nPredictions: {valid_objects}, Total Frames: {len(timestamps)}"
+    if gts_dataframe is not None:
+        gt_count = len(gt_frame) if "gt_frame" in locals() else 0
+        title += f", GT Objects: {gt_count}"
+
+    ax.set_title(title, fontsize=14, fontweight="bold")
+
+    # Create legend for classes and GT
+    legend_elements = []
+    if class_to_color:
+        legend_elements.extend(
+            [
+                patches.Patch(facecolor=color, edgecolor="black", label=f"Pred: {cls}")
+                for cls, color in class_to_color.items()
+            ]
+        )
+
+    if gts_dataframe is not None:
+        legend_elements.append(
+            patches.Patch(
+                facecolor="none",
+                edgecolor="red",
+                linewidth=3,
+                linestyle="-",
+                label="Ground Truth (Best Pred IoU)",
+            )
+        )
+
+    if legend_elements:
+        ax.legend(handles=legend_elements, loc="upper right", bbox_to_anchor=(1.15, 1))
+
+    # Save wide version
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+    # Now zoom in
+    plt.xlim(-50, 50)
+    plt.ylim(-50, 50)
+
+    # Remove artists outside the new view
+    for artist in plt.gca().texts:
+        if not (
+            -50 <= artist.get_position()[0] <= 50
+            and -50 <= artist.get_position()[1] <= 50
+        ):
+            artist.remove()
+
+    plt.savefig(save_path.replace(".png", "_tight.png"), dpi=300, bbox_inches="tight")
+
+    # Print summary statistics
+    valid_objects = len([s for s in outline_scores if s > score_thresh])
+    print("\nSummary Statistics:")
+    print(f"Valid objects in reference frame (score > 0): {valid_objects}")
+    print(f"Total objects in reference frame: {len(outline_boxes)}")
+    print(f"Classes present: {list(class_to_color.keys())}")
+
+    if gts_dataframe is not None:
+        gt_count = len(gt_frame) if "gt_frame" in locals() else 0
+        print(f"Ground truth objects in reference frame: {gt_count}")
+        if gt_count > 0:
+            gt_categories = (
+                gt_frame["category"].unique() if "gt_frame" in locals() else []
+            )
+            print(f"GT categories: {list(gt_categories)}")
+
+
 def load_and_plot_alpha_shapes(
     output_info_path: str,
     use_first_frame: bool = True,
-    ref_frame_idx: int = None,
+    ref_frame_idx: int = -1,
     plot_trajectories: bool = True,
     figsize: Tuple = (12, 10),
     save_path: Optional[str] = None,
@@ -1338,9 +1692,11 @@ def load_and_plot_alpha_shapes(
         object_trajectories[k] = np.array(object_trajectories[k])
 
     # Choose reference frame
-    if ref_frame_idx is None or (use_first_frame or len(frame_object_counts) == 0):
+
+    # if ref_frame_idx == -1 and (use_first_frame or len(frame_object_counts) == 0):
+    if use_first_frame:
         ref_frame_idx = 0
-    elif ref_frame_idx is None:
+    elif ref_frame_idx == -1:
         ref_frame_idx = np.argmax(frame_object_counts)
 
     # Plot alpha shapes from reference frame
@@ -1676,7 +2032,7 @@ def load_and_plot_alpha_shapes_camera(
     ref_frame_info = alpha_shape_infos[ref_frame_idx]
     alpha_shapes = ref_frame_info.get("alpha_shapes", [])
     alpha_ids = ref_frame_info.get("outline_ids", [])
-    pose = ref_frame_info.get("pose", np.eye(4))
+    ref_ego_pose = ref_frame_info.get("pose", np.eye(4))
 
     sweep_timestamp_ns = ref_frame_info['timestamp_ns']
 
@@ -1745,6 +2101,8 @@ def load_and_plot_alpha_shapes_camera(
         city_SE3_ego_lidar_t = timestamp_city_SE3_ego_dict[sweep_timestamp_ns]
         camera_model = camera_models[camera_name]
 
+
+        assert np.allclose(city_SE3_ego_lidar_t.transform_matrix, ref_ego_pose)
 
         image_path = camera_dir / f"{cam_timestamp_ns_str}.jpg"
 
@@ -4521,6 +4879,11 @@ def train_interpretable_classifier(
 
     print("\nTop 5 Most Important Features:")
     print(feature_importance.head())
+    try:
+        for index, row in feature_importance.iterrows():
+            print(f"{index} {row['feature']} {row['importance']:.2f}")
+    except Exception as e:
+        print('exception', e)
 
     # Method 1: Text representation of the tree
     tree_rules = export_text(
@@ -5425,8 +5788,8 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     for log_id in log_ids:
         output_path = get_owl_alpha_shape_output_path(output_dir, log_id)
 
-        # if output_path.exists():
-        #     os.remove(output_path)
+        if output_path.exists():
+            os.remove(output_path)
 
         if output_path.exists():
             print(f"{output_path=}")
@@ -5445,11 +5808,11 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
     not_done_log_ids = sorted(not_done_log_ids)
     print(f"not_done_log_ids {len(not_done_log_ids)}")
 
-    vis_log_id = '42f92807-0c5e-3397-bd45-9d5303b4db2a'
+    # vis_log_id = '42f92807-0c5e-3397-bd45-9d5303b4db2a'
     # vis_log_id = 'c2d44a70-9fd4-3298-ad0a-c4c9712e6f1e'
     vis_log_id = '27c03d98-6ac3-38a3-ba5e-102b184d01ef'
-    vis_log_id = 'e72ef05c-8b94-3885-a34f-fff3b2b954b4'
-    vis_log_id = np.random.choice(not_done_log_ids)
+    # vis_log_id = 'e72ef05c-8b94-3885-a34f-fff3b2b954b4'
+    # vis_log_id = not_done_log_ids[0]
 
     if len(owlvit_alpha_shape_log_ids) == 0 or True:
         # for log_id in [np.random.choice(not_done_log_ids)]:  # TODO: do all
@@ -5509,6 +5872,14 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
         log_id=vis_log_id,
     )
 
+    load_and_plot_global_boxes(
+        use_first_frame=False,  # Use frame with most objects
+        plot_trajectories=True,
+        gts_dataframe=gts.copy(),  # Add GT overlay
+        save_path="owlvit_alpha_shape_global_box_bev_visualization.png",
+        log_id=vis_log_id,
+    )
+
     # Create BEV plot with trajectories
     outline_infos = load_and_plot_alpha_shapes(
         vis_path,
@@ -5519,12 +5890,13 @@ def analyze_owl_alpha_shapes(args, cfg, dataset_dir: Path, output_dir: Path):
         log_id=vis_log_id,
     )
 
+    print("camera")
     outline_infos = load_and_plot_alpha_shapes_camera(
         vis_path,
         use_first_frame=False,  # Use frame with most objects
         plot_trajectories=True,
         gts_dataframe=gts.copy(),  # Add GT overlay
-        save_path="owlvit_alpha_shape_bev_visualization.png",
+        save_path="owlvit_alpha_shape_visualization.png",
         log_id=vis_log_id,
     )
 

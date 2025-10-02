@@ -13,3 +13,10 @@ venv/
 .DS_Store
 output
 version.py
+tools/**/**/**.png
+tools/**.png
+**.png
+_*.txt
+*.log
+data/**
+tools/*.txt
